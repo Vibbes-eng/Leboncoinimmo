@@ -333,8 +333,23 @@ async def accept_cookies(page):
         except Exception:
             continue
 
+def _is_logged_in(url: str) -> bool:
+    return "login" not in url and "connexion" not in url and "compte" not in url.split("?")[0].rstrip("/").split("/")[-1]
+
+
 async def login(page) -> bool:
-    print("  → Connexion à LeBonCoin...")
+    print("  → Vérification de la session LeBonCoin...")
+    await page.goto("https://www.leboncoin.fr/mes-favoris/recherches", wait_until="domcontentloaded")
+    await page.wait_for_timeout(2000)
+    await accept_cookies(page)
+
+    # Already logged in via saved profile?
+    if "mes-favoris" in page.url:
+        print("  ✓ Session existante détectée (profil persistant)")
+        return True
+
+    # Try automatic login
+    print("  → Tentative de connexion automatique...")
     await page.goto("https://www.leboncoin.fr/compte/login", wait_until="domcontentloaded")
     await page.wait_for_timeout(2500)
     await accept_cookies(page)
@@ -344,18 +359,40 @@ async def login(page) -> bool:
 
     try:
         await page.fill(email_sel, EMAIL)
-        await page.wait_for_timeout(400)
+        await page.wait_for_timeout(500)
         await page.fill(pwd_sel, PASSWORD)
-        await page.wait_for_timeout(400)
+        await page.wait_for_timeout(500)
         await page.click('button[type="submit"]')
+        await page.wait_for_timeout(4000)
     except Exception as e:
         print(f"  ✗ Formulaire introuvable: {e}")
-        await page.screenshot(path="output/debug_login.png")
-        return False
 
-    await page.wait_for_timeout(4000)
+    if "login" not in page.url and "connexion" not in page.url:
+        print("  ✓ Connecté automatiquement")
+        return True
 
-    if "login" not in page.url:
+    # Fallback: manual login
+    print()
+    print("  ┌─────────────────────────────────────────────────────────┐")
+    print("  │  CONNEXION MANUELLE REQUISE                             │")
+    print("  │  LeBonCoin a bloqué la connexion automatique.           │")
+    print("  │  Connectez-vous manuellement dans le navigateur.        │")
+    print("  │  Vous avez 120 secondes.                                │")
+    print("  └─────────────────────────────────────────────────────────┘")
+    print()
+
+    await page.goto("https://www.leboncoin.fr/compte/login", wait_until="domcontentloaded")
+    await accept_cookies(page)
+
+    try:
+        await page.wait_for_url("**/mes-favoris/**", timeout=120_000)
+        print("  ✓ Connexion manuelle détectée")
+        return True
+    except Exception:
+        pass
+
+    # Check current URL one more time
+    if "mes-favoris" in page.url or ("login" not in page.url and "connexion" not in page.url):
         print("  ✓ Connecté")
         return True
 
@@ -863,12 +900,14 @@ async def main():
 
     seen_urls = load_seen_urls()
 
+    # Persistent Chrome profile → survives between runs, bypasses bot detection
+    PROFILE_DIR = Path.home() / ".leboncoin_profile"
+    PROFILE_DIR.mkdir(exist_ok=True)
+
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=HEADLESS,
-            args=["--lang=fr-FR"],
-        )
-        context = await browser.new_context(
+        context = await pw.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR),
+            headless=False,          # Always visible for persistent profile
             locale="fr-FR",
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -876,20 +915,33 @@ async def main():
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1280, "height": 900},
+            args=[
+                "--lang=fr-FR",
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+            ignore_default_args=["--enable-automation"],
         )
-        page = await context.new_page()
+        # Mask navigator.webdriver on every page
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+
+        page = context.pages[0] if context.pages else await context.new_page()
 
         # 1. Login
         if not await login(page):
             print("\nImpossible de continuer sans connexion.")
-            await browser.close()
+            await context.close()
             return
 
         # 2. Saved searches
         searches = await get_saved_searches(page)
         if not searches:
             print("\nAucune recherche sauvegardée trouvée.")
-            await browser.close()
+            await context.close()
             return
 
         # 3. Scrape toutes les recherches
@@ -909,7 +961,7 @@ async def main():
         if unique:
             await enrich_external_data(page, unique)
 
-        await browser.close()
+        await context.close()
 
     # 6. Tri : loués en premier, puis rendement décroissant
     unique.sort(key=lambda l: (0 if l.get("already_rented") else 1,
