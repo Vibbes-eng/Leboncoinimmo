@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-LeBonCoin Rental Property Analyzer
+LeBonCoin Rental Property Analyzer — v2
 ─────────────────────────────────────────────────────────────────────────────
-• Se connecte au compte LeBonCoin
-• Parcourt toutes les recherches sauvegardées
-• Retient UNIQUEMENT les annonces où le loyer est mentionné explicitement
-• Calcule rentabilité brute ET nette
-• Filtre : loyer présent + prix ≤ MAX_PRICE + rendement ≥ MIN_YIELD
-• Trie : biens loués en priorité, puis par rendement décroissant
-• Exporte : CSV + rapport HTML interactif
-• Notifie via WhatsApp (CallMeBot, gratuit) les nouvelles annonces
+Champs extraits / calculés :
+  Annonce     : type, surface, prix, loyer HC, taxe foncière, charges,
+                nb lots, ville, CP, DPE, date, likes, lien
+  Calculs     : prix/m², frais notaire, coût total, renta brute, renta nette
+  Externes    : prix moyen/m² (meilleursagents.com), tension locative (locservice.fr)
+─────────────────────────────────────────────────────────────────────────────
 """
 
 import asyncio
@@ -24,40 +22,50 @@ from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 from dotenv import load_dotenv
 
+try:
+    from unidecode import unidecode
+except ImportError:
+    def unidecode(s): return s
+
 load_dotenv()
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-EMAIL       = os.getenv("LBC_EMAIL")
-PASSWORD    = os.getenv("LBC_PASSWORD")
-MIN_YIELD   = float(os.getenv("MIN_YIELD", "10.0"))    # rentabilité brute min %
-MAX_PRICE   = int(os.getenv("MAX_PRICE", "150000"))    # budget max €
-HEADLESS    = os.getenv("HEADLESS", "false").lower() == "true"
+# ── Config ────────────────────────────────────────────────────────────────────
+EMAIL      = os.getenv("LBC_EMAIL")
+PASSWORD   = os.getenv("LBC_PASSWORD")
+MIN_YIELD  = float(os.getenv("MIN_YIELD", "10.0"))
+MAX_PRICE  = int(os.getenv("MAX_PRICE", "150000"))
+HEADLESS   = os.getenv("HEADLESS", "false").lower() == "true"
+WA_PHONE   = os.getenv("WA_PHONE", "")
+WA_APIKEY  = os.getenv("WA_APIKEY", "")
 
-# WhatsApp via CallMeBot (gratuit) — remplir dans .env
-WA_PHONE    = os.getenv("WA_PHONE", "")               # ex: 33612345678
-WA_APIKEY   = os.getenv("WA_APIKEY", "")
-
-# Hypothèses pour rentabilité NETTE (personnalisables dans .env)
-CHARGES_RATE      = float(os.getenv("CHARGES_RATE", "0.15"))   # 15% loyer annuel (copro + entretien)
-TAXE_FONCIERE_MOIS= float(os.getenv("TAXE_FONCIERE_MOIS", "1.0"))  # ~ 1 mois de loyer/an
-VACANCE_MOIS      = float(os.getenv("VACANCE_MOIS", "0.5"))    # 0.5 mois de vacance/an
-
-OUTPUT_DIR  = Path("output")
+OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
-SEEN_FILE   = OUTPUT_DIR / "seen_urls.json"  # Pour détecter les nouvelles annonces
+SEEN_FILE  = OUTPUT_DIR / "seen_urls.json"
 
-# ── Rent / price helpers ───────────────────────────────────────────────────────
+# Cache externe (évite de refetcher la même ville)
+_ma_cache: dict = {}   # "city-cp" -> avg_price_sqm (int|None)
+_ls_cache: dict = {}   # "cp"      -> tension (str|None)
+
+# ── Regex patterns ────────────────────────────────────────────────────────────
 
 RENT_PATTERNS = [
     r'loyer\s+(?:actuel\s+)?(?:mensuel\s+)?(?:hors\s+charges?\s+)?(?:de\s+)?(\d[\d\s\u00a0]{1,6})\s*€',
     r'(\d[\d\s\u00a0]{1,6})\s*€\s*/?\s*(?:par\s+)?mois',
     r'(\d[\d\s\u00a0]{1,6})\s*€\s*(?:de\s+)?loyer',
     r'loyer\s*[:\-]\s*(\d[\d\s\u00a0]{1,6})',
-    r'loyer\s+(?:en\s+cours\s+)?(?:de\s+)?(\d[\d\s\u00a0]{1,6})',
     r'(\d[\d\s\u00a0]{1,6})\s*euros?\s*/?\s*mois',
-    r'(\d[\d\s\u00a0]{1,6})\s*€\s*cc',       # charges comprises
-    r'(\d[\d\s\u00a0]{1,6})\s*€\s*hc',       # hors charges
+    r'(\d[\d\s\u00a0]{1,6})\s*€\s*hc',
 ]
+CHARGES_PATTERNS = [
+    r'charges?\s*(?:mensuelles?\s+)?(?:de\s+copropri[eé]t[eé]\s+)?[:\-]?\s*(\d[\d\s\u00a0]{1,5})\s*€',
+    r'(\d[\d\s\u00a0]{1,5})\s*€\s*de\s+charges?',
+]
+TF_PATTERNS = [
+    r'taxe\s+fonci[eè]re?\s*[:\-]?\s*(\d[\d\s\u00a0]{1,6})\s*€',
+    r'\btf\b\s*[:\-]\s*(\d[\d\s\u00a0]{1,6})\s*€',
+]
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def clean_number(s: str) -> int | None:
     s = re.sub(r'[\s\u00a0]', '', s)
@@ -67,8 +75,8 @@ def clean_number(s: str) -> int | None:
         return None
 
 def extract_rent(text: str) -> int | None:
-    for pattern in RENT_PATTERNS:
-        m = re.search(pattern, text, re.IGNORECASE)
+    for p in RENT_PATTERNS:
+        m = re.search(p, text, re.IGNORECASE)
         if m:
             val = clean_number(m.group(1))
             if val and 100 <= val <= 15_000:
@@ -92,30 +100,196 @@ def extract_surface(text: str) -> int | None:
             return None
     return None
 
+def extract_charges(text: str) -> int | None:
+    for p in CHARGES_PATTERNS:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            val = clean_number(m.group(1))
+            if val and 10 <= val <= 5_000:
+                return val
+    return None
+
+def extract_taxe_fonciere(text: str) -> int | None:
+    for p in TF_PATTERNS:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            val = clean_number(m.group(1))
+            if val and 50 <= val <= 20_000:
+                return val
+    return None
+
+def extract_nb_lots(text: str) -> str | None:
+    for p in [r'(\d+)\s*lots?', r'(\d+)\s*appartements?', r'(\d+)\s*logements?',
+               r'divis[eé]\s+en\s+(\d+)', r'lot\s+n[°o]?\s*\d+\s*/\s*(\d+)']:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            return m.group(0).strip()
+    return None
+
+def extract_dpe(text: str) -> str | None:
+    for p in [r'\bDPE\s*[:\-]?\s*([A-G])\b', r'\bclasse\s*[:\-]?\s*([A-G])\b',
+               r'\b([A-G])\s*\(DPE\)', r'énergie\s*[:\-]?\s*([A-G])\b']:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            return m.group(1).upper()
+    return None
+
+def extract_property_type(text: str) -> str:
+    t = text.lower()
+    if 'immeuble' in t: return 'Immeuble'
+    if 'maison' in t or 'villa' in t: return 'Maison'
+    if 'studio' in t: return 'Studio'
+    if 'appartement' in t or 'appt' in t: return 'Appartement'
+    if 'terrain' in t: return 'Terrain'
+    if 'commerce' in t or 'local' in t: return 'Local commercial'
+    return 'Autre'
+
+def extract_city_cp(location: str) -> tuple:
+    if not location:
+        return None, None
+    m = re.search(r'(.+?)\s*\((\d{5})\)', location)
+    if m: return m.group(1).strip(), m.group(2)
+    m = re.search(r'(\d{5})\s+(.+)', location)
+    if m: return m.group(2).strip(), m.group(1)
+    m = re.search(r'(.+?)\s+(\d{5})', location)
+    if m: return m.group(1).strip(), m.group(2)
+    return location.strip(), None
+
 def is_already_rented(text: str) -> bool:
-    """Returns True if the listing clearly indicates the property is currently rented."""
-    keywords = [
-        "loué", "loue ", "bien loué", "actuellement loué", "occupé",
-        "locataire en place", "bail en cours", "vendu loué",
-        "investi", "déjà loué", "bail", "en location",
-    ]
+    keywords = ["loué", "loue ", "actuellement loué", "occupé",
+                "locataire en place", "bail en cours", "vendu loué",
+                "investi", "déjà loué", "en location"]
     low = text.lower()
     return any(kw in low for kw in keywords)
 
-# ── Yield calculations ─────────────────────────────────────────────────────────
+def city_to_slug(city: str) -> str:
+    slug = unidecode(city.lower().strip())
+    slug = re.sub(r'[^a-z0-9]+', '-', slug)
+    return slug.strip('-')
 
-def calc_yields(price: int, monthly_rent: int) -> dict:
-    annual_rent = monthly_rent * 12
-    brute = round((annual_rent / price) * 100, 2)
+# ── Frais de notaire (bien ancien) ───────────────────────────────────────────
 
-    # Net estimation
-    charges      = annual_rent * CHARGES_RATE
-    taxe_fonc    = monthly_rent * TAXE_FONCIERE_MOIS
-    vacance      = monthly_rent * VACANCE_MOIS
-    net_annual   = annual_rent - charges - taxe_fonc - vacance
-    net          = round((net_annual / price) * 100, 2)
+def calc_notaire_fees(price: int) -> tuple:
+    """Retourne (montant_€, taux_%)."""
+    droits  = price * 0.0580665
+    emo     = 0.0
+    tranches = [(6500, 0.03870), (10500, 0.01596), (43000, 0.01064)]
+    remaining = price
+    for montant, taux in tranches:
+        emo += min(remaining, montant) * taux
+        remaining -= montant
+        if remaining <= 0: break
+    if remaining > 0: emo += remaining * 0.00799
+    emo_ttc = emo * 1.20
+    total = droits + emo_ttc + price * 0.001 + 1000
+    return round(total), round(total / price * 100, 2)
 
-    return {"gross_yield_pct": brute, "net_yield_pct": net}
+# ── Calcul rentabilité ────────────────────────────────────────────────────────
+
+def calc_all_yields(price: int, rent_hc: int,
+                    taxe_fonciere: int | None,
+                    charges_monthly: int | None) -> dict:
+    notaire_fees, notaire_rate = calc_notaire_fees(price)
+    total_cost   = price + notaire_fees
+    annual_rent  = rent_hc * 12
+    gross        = round(annual_rent / price * 100, 2)
+    tf           = taxe_fonciere if taxe_fonciere else round(rent_hc * 1.0)
+    ch_a         = charges_monthly * 12 * 0.25 if charges_monthly else round(annual_rent * 0.10)
+    vac          = round(rent_hc * 0.5)
+    net          = round((annual_rent - tf - ch_a - vac) / total_cost * 100, 2)
+    return {
+        "gross_yield_pct":   gross,
+        "net_yield_pct":     net,
+        "notaire_fees":      notaire_fees,
+        "notaire_fees_rate": notaire_rate,
+        "total_cost":        total_cost,
+    }
+
+# ── Données externes ─────────────────────────────────────────────────────────
+
+async def fetch_avg_price_sqm(page, city: str, postal_code: str) -> int | None:
+    """Prix moyen/m² depuis meilleursagents.com."""
+    key = f"{city}-{postal_code}"
+    if key in _ma_cache:
+        return _ma_cache[key]
+    slug = city_to_slug(city)
+    url  = f"https://www.meilleursagents.com/prix-immobilier/{slug}-{postal_code}/"
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+        await page.wait_for_timeout(2000)
+        content = await page.content()
+        m = re.search(r'(\d[\d\s\u00a0]{2,6})\s*€\s*/\s*m[²2]', content)
+        if m:
+            val = clean_number(m.group(1))
+            if val and 500 <= val <= 30_000:
+                _ma_cache[key] = val
+                return val
+        m2 = re.search(r'"price_per_sqm"\s*:\s*(\d+)', content)
+        if m2:
+            val = int(m2.group(1))
+            _ma_cache[key] = val
+            return val
+    except Exception:
+        pass
+    _ma_cache[key] = None
+    return None
+
+
+async def fetch_rental_tension(page, postal_code: str) -> str | None:
+    """Tension locative depuis locservice.fr."""
+    if postal_code in _ls_cache:
+        return _ls_cache[postal_code]
+    try:
+        await page.goto(
+            f"https://www.locservice.fr/tensiometre/?cp={postal_code}",
+            wait_until="domcontentloaded", timeout=20_000
+        )
+        await page.wait_for_timeout(2500)
+        content = await page.content()
+        for p in [r'class="[^"]*tension[^"]*"[^>]*>\s*([^<]+)',
+                   r'"tension"\s*:\s*"([^"]+)"',
+                   r'tension\s+(?:locative\s+)?(?:est\s+)?(\w+)']:
+            m = re.search(p, content, re.IGNORECASE)
+            if m:
+                t = m.group(1).strip()
+                if t and len(t) < 30:
+                    _ls_cache[postal_code] = t
+                    return t
+        for sel in ['[class*="tension"]', '.tensiometre-value', '[id*="tension"]']:
+            el = await page.query_selector(sel)
+            if el:
+                t = (await el.text_content()).strip()
+                if t and len(t) < 50:
+                    _ls_cache[postal_code] = t
+                    return t
+    except Exception:
+        pass
+    _ls_cache[postal_code] = None
+    return None
+
+
+async def enrich_external_data(page, listings: list) -> None:
+    """Enrichit chaque listing avec prix marché/m² et tension locative."""
+    unique_cities = {(l["city"], l["postal_code"])
+                     for l in listings if l.get("city") and l.get("postal_code")}
+    unique_cps    = {l["postal_code"] for l in listings if l.get("postal_code")}
+
+    print(f"\n  → Données externes pour {len(unique_cities)} ville(s)...")
+    for city, cp in unique_cities:
+        print(f"    MA  {city} ({cp})...", end=" ", flush=True)
+        val = await fetch_avg_price_sqm(page, city, cp)
+        print(f"{val} €/m²" if val else "N/D")
+    for cp in unique_cps:
+        print(f"    LS  {cp}...", end=" ", flush=True)
+        t = await fetch_rental_tension(page, cp)
+        print(t or "N/D")
+
+    for l in listings:
+        if l.get("city") and l.get("postal_code"):
+            key = f"{l['city']}-{l['postal_code']}"
+            l["avg_price_sqm"]  = _ma_cache.get(key)
+            l["rental_tension"] = _ls_cache.get(l["postal_code"])
+
 
 # ── WhatsApp notification ──────────────────────────────────────────────────────
 
@@ -270,67 +444,125 @@ async def get_listing_stubs(page) -> list[dict]:
 
 async def scrape_listing_detail(page, url: str) -> dict | None:
     """
-    Visit a single listing.
-    Returns None if price > MAX_PRICE or no rent found.
+    Visite une annonce et extrait tous les champs.
+    Retourne None si prix > MAX_PRICE ou si le loyer est absent.
     """
-    data = {
-        "url": url, "title": None, "price": None, "surface": None,
-        "location": None, "description": None,
-        "monthly_rent": None, "rent_source": None,
-        "gross_yield_pct": None, "net_yield_pct": None,
-        "already_rented": False,
+    data: dict = {
+        # Annonce
+        "url": url, "title": None, "property_type": None, "surface": None,
+        "price": None, "price_per_sqm": None,
+        "rent_hc": None,
+        # Charges & fiscalité
+        "charges_monthly": None, "charges_annual": None, "taxe_fonciere": None,
+        # Calculs
+        "notaire_fees": None, "notaire_fees_rate": None,
+        "total_cost": None, "gross_yield_pct": None, "net_yield_pct": None,
+        # Localisation
+        "city": None, "postal_code": None, "location": None,
+        # Bien
+        "nb_lots": None, "dpe": None,
+        # Meta annonce
+        "listing_date": None, "nb_likes": None, "already_rented": False,
+        # Données externes
+        "avg_price_sqm": None, "rental_tension": None,
     }
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
         await page.wait_for_timeout(1500)
 
-        # Title
+        # Titre
         for sel in ['h1', '[data-qa-id="adview_title"]', '[class*="Title"]']:
             el = await page.query_selector(sel)
             if el:
                 data["title"] = (await el.text_content()).strip()
                 break
 
-        # Price — early exit if over budget
+        # Prix — sortie anticipée si hors budget
         for sel in ['[data-qa-id="adview_price"]', '[class*="price"]', '[class*="Price"]']:
             el = await page.query_selector(sel)
             if el:
                 data["price"] = extract_price(await el.text_content())
                 if data["price"]:
                     break
-
         if data["price"] and data["price"] > MAX_PRICE:
-            return None  # Over budget, skip
+            return None
 
-        # Location
-        for sel in ['[data-qa-id="adview_location_informations"]', '[class*="location"]']:
+        # Localisation
+        for sel in ['[data-qa-id="adview_location_informations"]', '[class*="location"]', '[class*="Location"]']:
             el = await page.query_selector(sel)
             if el:
                 data["location"] = (await el.text_content()).strip()
                 break
+        data["city"], data["postal_code"] = extract_city_cp(data.get("location"))
 
         # Description
+        description = ""
         for sel in ['[data-qa-id="adview_description_container"]', '[class*="description"]']:
             el = await page.query_selector(sel)
             if el:
-                data["description"] = (await el.text_content()).strip()
+                description = (await el.text_content()).strip()
                 break
 
-        full_text = f"{data.get('title','') or ''} {data.get('description','') or ''}"
+        # Section critères / attributs
+        attrs_text = ""
+        for sel in ['[data-qa-id="criteria_list"]', '[class*="criteria"]', '[class*="Criteria"]',
+                    '[class*="attribute"]', '[class*="Attribute"]']:
+            els = await page.query_selector_all(sel)
+            for el in els:
+                try:
+                    attrs_text += " " + (await el.text_content())
+                except Exception:
+                    pass
 
-        data["surface"]         = extract_surface(full_text)
-        data["already_rented"]  = is_already_rented(full_text)
+        # Date de l'annonce
+        for sel in ['[data-qa-id="adview_date"]', 'time', '[class*="date"]', '[class*="Date"]']:
+            el = await page.query_selector(sel)
+            if el:
+                dt = (await el.text_content()).strip()
+                if dt:
+                    data["listing_date"] = dt[:30]
+                    break
+
+        # Likes / favoris
+        for sel in ['[data-qa-id="adview_watchlist_button"]', '[class*="favorite"]',
+                    '[class*="Favorite"]', '[class*="like"]', '[aria-label*="favori"]']:
+            el = await page.query_selector(sel)
+            if el:
+                txt = (await el.text_content()).strip()
+                m = re.search(r'\d+', txt)
+                if m:
+                    data["nb_likes"] = int(m.group())
+                    break
+
+        # Texte complet pour extraction
+        full_text = f"{data.get('title','') or ''} {description} {attrs_text}"
+
+        data["surface"]        = extract_surface(full_text)
+        data["property_type"]  = extract_property_type(full_text)
+        data["already_rented"] = is_already_rented(full_text)
+        data["dpe"]            = extract_dpe(full_text)
+        data["nb_lots"]        = extract_nb_lots(full_text)
+        data["taxe_fonciere"]  = extract_taxe_fonciere(full_text)
+        ch = extract_charges(full_text)
+        if ch:
+            data["charges_monthly"] = ch
+            data["charges_annual"]  = ch * 12
+
+        # Loyer (filtre strict)
         rent = extract_rent(full_text)
-
-        # ── STRICT FILTER: only keep listings with explicit rent ──
         if not rent:
             return None
+        data["rent_hc"] = rent
 
-        data["monthly_rent"]  = rent
-        data["rent_source"]   = "annonce"
-        yields = calc_yields(data["price"], rent) if data["price"] else {}
-        data.update(yields)
+        # Calculs dérivés
+        if data["price"]:
+            if data["surface"]:
+                data["price_per_sqm"] = round(data["price"] / data["surface"])
+            data.update(calc_all_yields(
+                data["price"], rent,
+                data["taxe_fonciere"], data["charges_monthly"]
+            ))
 
     except PlaywrightTimeout:
         print(f"    ⚠ Timeout: {url}")
@@ -390,150 +622,227 @@ async def scrape_search(page, search: dict) -> list[dict]:
 
     results = []
     for stub in stubs:
-        # Quick pre-filter: price visible in card
         card_price = extract_price(stub["card_text"])
         if card_price and card_price > MAX_PRICE:
-            continue  # Skip before visiting
-
+            continue
         detail = await scrape_listing_detail(page, stub["url"])
         if detail:
             results.append(detail)
-            gy  = detail.get("gross_yield_pct", "?")
-            ny  = detail.get("net_yield_pct", "?")
-            rent = detail.get("monthly_rent", "?")
-            print(f"    ✓ {gy}% brut / {ny}% net — {rent}€/mois — {detail.get('title','')[:45]}")
+            gy = detail.get("gross_yield_pct", "?")
+            ny = detail.get("net_yield_pct", "?")
+            print(f"    ✓ {gy}% brut / {ny}% net — {detail.get('rent_hc','?')}€/mois"
+                  f" — {(detail.get('title') or '')[:40]}")
         await page.wait_for_timeout(600)
 
-    print(f"    → {len(results)} annonce(s) retenue(s) (loyer explicite + budget)")
+    print(f"    → {len(results)} annonce(s) retenue(s)")
     return results
 
-# ── Export ─────────────────────────────────────────────────────────────────────
+# ── Export CSV ────────────────────────────────────────────────────────────────
 
-def export_csv(listings: list[dict], path: Path):
-    fields = [
-        "gross_yield_pct", "net_yield_pct", "monthly_rent", "price",
-        "surface", "location", "already_rented", "title", "url", "rent_source"
-    ]
+CSV_FIELDS = [
+    "gross_yield_pct", "net_yield_pct", "property_type", "surface", "price",
+    "price_per_sqm", "notaire_fees", "notaire_fees_rate", "total_cost",
+    "rent_hc", "charges_monthly", "charges_annual", "taxe_fonciere",
+    "nb_lots", "dpe", "city", "postal_code", "listing_date", "nb_likes",
+    "avg_price_sqm", "rental_tension", "already_rented", "title", "url",
+]
+
+def export_csv(listings: list, path: Path):
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(listings)
     print(f"  ✓ CSV → {path}")
 
 
-def export_html(listings: list[dict], path: Path, min_yield: float):
-    above = [l for l in listings if l.get("gross_yield_pct", 0) >= min_yield]
+# ── Export HTML ───────────────────────────────────────────────────────────────
+
+DPE_COLORS = {
+    "A": "#009a44", "B": "#50b848", "C": "#c8d400",
+    "D": "#ffcc00", "E": "#f7a600", "F": "#ee7200", "G": "#e2001a"
+}
+
+def _fmt(val, suffix="", fallback="—"):
+    if val is None: return fallback
+    if isinstance(val, float):
+        return f"{val:.2f}{suffix}"
+    if isinstance(val, int):
+        return f"{val:,}{suffix}".replace(",", "\u202f")
+    return str(val) + suffix
+
+def _dpe(letter):
+    if not letter: return "—"
+    c = DPE_COLORS.get(letter.upper(), "#999")
+    return f'<span class="dpe" style="background:{c}">{letter.upper()}</span>'
+
+def _yield_span(val, min_y):
+    if val is None: return "—"
+    cls = "yh" if val >= min_y else ("ym" if val >= 7 else "yl")
+    return f'<span class="{cls}">{val:.2f}%</span>'
+
+def _row(l, min_yield):
+    badge = '<span class="bl">★ Loué</span> ' if l.get("already_rented") else ""
+    title = (l.get("title") or l["url"])[:55]
+    nf    = _fmt(l.get("notaire_fees"))
+    nfr   = f'<small>({_fmt(l.get("notaire_fees_rate"), "%")})</small>' if l.get("notaire_fees_rate") else ""
+    return (
+        f'<tr>'
+        f'<td>{_yield_span(l.get("gross_yield_pct"), min_yield)}</td>'
+        f'<td>{_yield_span(l.get("net_yield_pct"), min_yield)}</td>'
+        f'<td>{l.get("property_type") or "—"}</td>'
+        f'<td>{_fmt(l.get("surface"), " m²")}</td>'
+        f'<td>{_fmt(l.get("price"), " €")}</td>'
+        f'<td>{nf} € {nfr}</td>'
+        f'<td><b>{_fmt(l.get("total_cost"), " €")}</b></td>'
+        f'<td>{_fmt(l.get("rent_hc"), " €")}</td>'
+        f'<td>{_fmt(l.get("charges_monthly"), " €")}</td>'
+        f'<td>{_fmt(l.get("charges_annual"), " €")}</td>'
+        f'<td>{_fmt(l.get("taxe_fonciere"), " €")}</td>'
+        f'<td>{l.get("nb_lots") or "—"}</td>'
+        f'<td>{_dpe(l.get("dpe"))}</td>'
+        f'<td>{_fmt(l.get("price_per_sqm"), " €/m²")}</td>'
+        f'<td>{_fmt(l.get("avg_price_sqm"), " €/m²")}</td>'
+        f'<td>{l.get("rental_tension") or "—"}</td>'
+        f'<td>{l.get("city") or "—"}<br><small>{l.get("postal_code") or ""}</small></td>'
+        f'<td style="font-size:.8em">{l.get("listing_date") or "—"}</td>'
+        f'<td>{_fmt(l.get("nb_likes"))}</td>'
+        f'<td>{badge}<a href="{l["url"]}" target="_blank">{title}</a></td>'
+        f'</tr>\n'
+    )
+
+def export_html(listings: list, path: Path, min_yield: float):
+    above = [l for l in listings if (l.get("gross_yield_pct") or 0) >= min_yield]
     below = [l for l in listings if l not in above]
+    rows  = "".join(_row(l, min_yield) for l in above + below)
 
-    def row(l, highlight=False):
-        gy   = l.get("gross_yield_pct")
-        ny   = l.get("net_yield_pct")
-        gy_s = f"{gy:.2f}%" if gy else "—"
-        ny_s = f"{ny:.2f}%" if ny else "—"
-        rent = f"{l.get('monthly_rent'):,} €/mois".replace(",", "\u202f") if l.get("monthly_rent") else "—"
-        price= f"{l.get('price'):,} €".replace(",", "\u202f") if l.get("price") else "—"
-        surf = f"{l.get('surface')} m²" if l.get("surface") else "—"
-        badge= '<span class="badge">Loué</span>' if l.get("already_rented") else ""
-        cls  = "high" if gy and gy >= min_yield else "mid"
-        hl   = ' style="background:#fff8f0"' if highlight else ""
-        return f"""<tr{hl}>
-            <td><b class="y-{cls}">{gy_s}</b></td>
-            <td><span class="y-net">{ny_s}</span></td>
-            <td>{rent}</td><td>{price}</td><td>{surf}</td>
-            <td>{l.get('location') or '—'}</td>
-            <td>{badge} <a href="{l['url']}" target="_blank">{(l.get('title') or '')[:55]}</a></td>
-        </tr>"""
-
-    rows = "".join(row(l, True) for l in above) + "".join(row(l) for l in below)
+    nb_loues  = sum(1 for l in listings if l.get("already_rented"))
+    nb_net_ok = sum(1 for l in listings if (l.get("net_yield_pct") or 0) >= min_yield)
+    nb_dpe    = sum(1 for l in listings if l.get("dpe"))
 
     html = f"""<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
+<html lang="fr"><head><meta charset="UTF-8">
 <title>LeBonCoin — Rentabilité locative</title>
 <style>
-  *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{font-family:system-ui,Arial,sans-serif;background:#f4f4f4;color:#222;padding:20px}}
-  h1{{color:#e0460b;margin-bottom:4px}}
-  .sub{{color:#666;font-size:.9em;margin-bottom:20px}}
-  .stats{{display:flex;gap:16px;margin-bottom:20px;flex-wrap:wrap}}
-  .stat{{background:#fff;border-radius:10px;padding:14px 22px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.08)}}
-  .stat .val{{font-size:2em;font-weight:700;color:#e0460b}}
-  .stat .lbl{{font-size:.82em;color:#666;margin-top:2px}}
-  table{{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.08)}}
-  th{{background:#e0460b;color:#fff;padding:10px 12px;text-align:left;cursor:pointer;white-space:nowrap;font-size:.9em}}
-  th:hover{{background:#c23a08}}
-  td{{padding:8px 12px;border-bottom:1px solid #f0f0f0;font-size:.88em;vertical-align:middle}}
-  tr:hover td{{background:#fef5f2}}
-  .y-high{{color:#177a17;font-weight:700;font-size:1.05em}}
-  .y-mid{{color:#b06000;font-weight:600}}
-  .y-net{{color:#555;font-size:.92em}}
-  .badge{{background:#177a17;color:#fff;padding:1px 7px;border-radius:10px;font-size:.76em;white-space:nowrap}}
-  a{{color:#e0460b;text-decoration:none}}
-  a:hover{{text-decoration:underline}}
-  .sep td{{background:#fce9e3;font-weight:600;color:#e0460b;font-size:.82em;padding:5px 12px}}
-  input#search{{padding:8px 14px;border:1px solid #ddd;border-radius:8px;font-size:.9em;width:280px;margin-bottom:12px}}
-  .note{{font-size:.78em;color:#999;margin-top:14px}}
-</style>
-</head>
-<body>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:system-ui,Arial,sans-serif;background:#f2f2f2;color:#222;padding:16px}}
+h1{{color:#e0460b;margin-bottom:4px;font-size:1.5em}}
+.sub{{color:#777;font-size:.85em;margin-bottom:16px}}
+.stats{{display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap}}
+.stat{{background:#fff;border-radius:8px;padding:12px 18px;text-align:center;
+       box-shadow:0 1px 3px rgba(0,0,0,.1);min-width:110px}}
+.stat .val{{font-size:1.8em;font-weight:700;color:#e0460b}}
+.stat .lbl{{font-size:.74em;color:#777;margin-top:2px}}
+.toolbar{{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}}
+#search{{padding:7px 12px;border:1px solid #ddd;border-radius:6px;font-size:.88em;width:260px}}
+.btn{{padding:7px 14px;background:#e0460b;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:.84em}}
+.btn:hover{{background:#c23a08}}
+.wrap{{overflow-x:auto;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.1)}}
+table{{border-collapse:collapse;background:#fff;white-space:nowrap;font-size:.82em}}
+thead th{{background:#e0460b;color:#fff;padding:8px 10px;text-align:left;
+          cursor:pointer;position:sticky;top:0;z-index:2}}
+thead th:hover{{background:#c23a08}}
+td{{padding:7px 10px;border-bottom:1px solid #f0f0f0;vertical-align:middle}}
+tr:hover td{{background:#fef5f2}}
+.yh{{color:#177a17;font-weight:700}}
+.ym{{color:#b06000;font-weight:600}}
+.yl{{color:#aaa}}
+.dpe{{display:inline-block;color:#fff;font-weight:700;
+      padding:1px 7px;border-radius:4px;font-size:.9em}}
+.bl{{background:#177a17;color:#fff;padding:1px 6px;
+     border-radius:10px;font-size:.75em;white-space:nowrap}}
+a{{color:#e0460b;text-decoration:none}}
+a:hover{{text-decoration:underline}}
+.note{{font-size:.74em;color:#aaa;margin-top:12px;line-height:1.7}}
+</style></head><body>
 <h1>LeBonCoin — Analyse rentabilité locative</h1>
-<p class="sub">Généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')} &nbsp;|&nbsp;
-  Seuil : <b>{min_yield}%</b> brut &nbsp;|&nbsp; Budget max : <b>{MAX_PRICE:,} €</b></p>
+<p class="sub">Généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')}
+  &nbsp;|&nbsp; Seuil : <b>{min_yield}%</b> brut
+  &nbsp;|&nbsp; Budget max : <b>{MAX_PRICE:,} €</b></p>
 
 <div class="stats">
-  <div class="stat"><div class="val">{len(listings)}</div><div class="lbl">annonces (loyer explicite)</div></div>
-  <div class="stat"><div class="val" style="color:#177a17">{len(above)}</div><div class="lbl">≥ {min_yield}% rentabilité brute</div></div>
-  <div class="stat"><div class="val">{sum(1 for l in listings if l.get("already_rented"))}</div><div class="lbl">déjà loués</div></div>
-  <div class="stat"><div class="val">{sum(1 for l in listings if l.get("net_yield_pct") and l["net_yield_pct"] >= min_yield)}</div><div class="lbl">≥ {min_yield}% rentabilité nette</div></div>
+  <div class="stat"><div class="val">{len(listings)}</div><div class="lbl">annonces analysées</div></div>
+  <div class="stat"><div class="val" style="color:#177a17">{len(above)}</div><div class="lbl">≥ {min_yield}% brut</div></div>
+  <div class="stat"><div class="val">{nb_net_ok}</div><div class="lbl">≥ {min_yield}% net</div></div>
+  <div class="stat"><div class="val">{nb_loues}</div><div class="lbl">déjà loués</div></div>
+  <div class="stat"><div class="val">{nb_dpe}</div><div class="lbl">DPE renseigné</div></div>
 </div>
 
-<input id="search" type="text" placeholder="Filtrer (ville, prix…)" oninput="filterTable(this.value)">
+<div class="toolbar">
+  <input id="search" type="text" placeholder="Filtrer par ville, type, DPE…"
+         oninput="filterTable(this.value)">
+  <button class="btn" onclick="exportCSV()">⬇ Exporter CSV</button>
+</div>
 
-<table id="tbl">
-<thead><tr>
+<div class="wrap">
+<table id="tbl"><thead><tr>
   <th onclick="sortTable(0)">Brut ↕</th>
   <th onclick="sortTable(1)">Net ↕</th>
-  <th onclick="sortTable(2)">Loyer/mois ↕</th>
-  <th onclick="sortTable(3)">Prix ↕</th>
-  <th>Surface</th>
-  <th>Localisation</th>
+  <th>Type</th>
+  <th onclick="sortTable(3)">Surface ↕</th>
+  <th onclick="sortTable(4)">Prix ↕</th>
+  <th>Frais notaire</th>
+  <th onclick="sortTable(6)">Coût total ↕</th>
+  <th onclick="sortTable(7)">Loyer HC/mois ↕</th>
+  <th>Charges/mois</th>
+  <th>Charges/an</th>
+  <th>Taxe fonc./an</th>
+  <th>Nb lots</th>
+  <th>DPE</th>
+  <th onclick="sortTable(13)">Prix/m² ↕</th>
+  <th onclick="sortTable(14)">Moy. marché/m² ↕</th>
+  <th>Tension locative</th>
+  <th>Ville / CP</th>
+  <th>Date annonce</th>
+  <th>❤ Likes</th>
   <th>Annonce</th>
 </tr></thead>
 <tbody>
 {rows}
-</tbody>
-</table>
+</tbody></table>
+</div>
 
 <p class="note">
-  Rentabilité nette estimée = loyer annuel - charges ({int(CHARGES_RATE*100)}%) - taxe foncière (~{TAXE_FONCIERE_MOIS} mois) - vacance (~{VACANCE_MOIS} mois) &nbsp;/&nbsp; prix d'achat.<br>
-  Seules les annonces mentionnant explicitement un loyer sont affichées.
+  <b>Rentabilité nette</b> = (loyer annuel − taxe foncière − charges copro non récupérables ~25% − vacance ~0,5 mois) / coût total (prix + frais de notaire).<br>
+  <b>Frais de notaire</b> : bien ancien — droits de mutation 5,81% + émoluments notaire + CSI 0,1% + débours ~1 000 €.<br>
+  Taxe foncière et charges : extraites de l'annonce si disponibles, sinon estimées (1 mois loyer / 10% loyer annuel).<br>
+  Prix moyen/m² : <a href="https://www.meilleursagents.com" target="_blank">meilleursagents.com</a> &nbsp;|&nbsp;
+  Tension locative : <a href="https://www.locservice.fr/tensiometre/" target="_blank">locservice.fr</a>
 </p>
 
 <script>
+const TBL = document.getElementById('tbl');
 function sortTable(col) {{
-  const t = document.getElementById('tbl');
-  const b = t.tBodies[0];
-  const rows = [...b.rows].filter(r => !r.classList.contains('sep'));
-  const asc = t.dataset.col == col && t.dataset.dir == 'asc';
-  rows.sort((a,b) => {{
+  const b = TBL.tBodies[0];
+  const rows = [...b.rows];
+  const asc  = TBL.dataset.col == col && TBL.dataset.dir == 'asc';
+  rows.sort((a, b) => {{
     const av = parseFloat(a.cells[col]?.innerText) || 0;
     const bv = parseFloat(b.cells[col]?.innerText) || 0;
-    return asc ? av-bv : bv-av;
+    return asc ? av - bv : bv - av;
   }});
   rows.forEach(r => b.appendChild(r));
-  t.dataset.col = col; t.dataset.dir = asc ? 'desc' : 'asc';
+  TBL.dataset.col = col;
+  TBL.dataset.dir = asc ? 'desc' : 'asc';
 }}
 function filterTable(q) {{
   q = q.toLowerCase();
-  [...document.querySelectorAll('#tbl tbody tr:not(.sep)')].forEach(r => {{
+  [...TBL.tBodies[0].rows].forEach(r => {{
     r.style.display = r.innerText.toLowerCase().includes(q) ? '' : 'none';
   }});
 }}
+function exportCSV() {{
+  const rows = [...TBL.rows];
+  const csv  = rows.map(r =>
+    [...r.cells].map(c => '"' + c.innerText.replace(/"/g,'""') + '"').join(',')
+  ).join('\\n');
+  const a = document.createElement('a');
+  a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+  a.download = 'leboncoin_analyse.csv';
+  a.click();
+}}
 window.onload = () => sortTable(0);
 </script>
-</body>
-</html>"""
+</body></html>"""
 
     path.write_text(html, encoding="utf-8")
     print(f"  ✓ HTML → {path}")
@@ -583,66 +892,67 @@ async def main():
             await browser.close()
             return
 
-        # 3. Scrape
-        all_listings: list[dict] = []
+        # 3. Scrape toutes les recherches
+        all_listings: list = []
         for search in searches:
-            results = await scrape_search(page, search)
-            all_listings.extend(results)
+            all_listings.extend(await scrape_search(page, search))
+
+        # 4. Dédoublonnage par URL
+        seen_u: set = set()
+        unique = []
+        for l in all_listings:
+            if l["url"] not in seen_u:
+                seen_u.add(l["url"])
+                unique.append(l)
+
+        # 5. Enrichissement données externes (meilleursagents + locservice)
+        if unique:
+            await enrich_external_data(page, unique)
 
         await browser.close()
 
-    # 4. Deduplicate
-    seen_u: set = set()
-    unique = []
-    for l in all_listings:
-        if l["url"] not in seen_u:
-            seen_u.add(l["url"])
-            unique.append(l)
+    # 6. Tri : loués en premier, puis rendement décroissant
+    unique.sort(key=lambda l: (0 if l.get("already_rented") else 1,
+                               -(l.get("gross_yield_pct") or 0)))
+    qualified = [l for l in unique if (l.get("gross_yield_pct") or 0) >= MIN_YIELD]
 
-    # 5. Filter by MIN_YIELD (brut)
-    qualified = [l for l in unique if l.get("gross_yield_pct") and l["gross_yield_pct"] >= MIN_YIELD]
-
-    # 6. Sort: already rented first, then by gross yield desc
-    qualified.sort(key=lambda l: (0 if l.get("already_rented") else 1, -(l.get("gross_yield_pct") or 0)))
-
-    # 7. Detect NEW listings (for WhatsApp notification)
+    # 7. Nouvelles annonces
     new_listings = [l for l in qualified if l["url"] not in seen_urls]
     save_seen_urls(seen_u)
 
-    # ── Summary ────────────────────────────────────────────────────────────────
-    print("\n" + "=" * 62)
+    # ── Résumé console ────────────────────────────────────────────────────────
+    print("\n" + "=" * 64)
     print("  RÉSULTATS")
-    print(f"  Annonces avec loyer explicite   : {len(unique)}")
-    print(f"  Rentabilité ≥ {MIN_YIELD}%              : {len(qualified)}")
-    print(f"  Nouvelles annonces (ce scan)     : {len(new_listings)}")
-    print("=" * 62)
+    print(f"  Annonces retenues (loyer explicite) : {len(unique)}")
+    print(f"  Rentabilité brute ≥ {MIN_YIELD}%          : {len(qualified)}")
+    print(f"  Nouvelles ce scan                   : {len(new_listings)}")
+    print("=" * 64)
 
-    if qualified:
-        print(f"\n  TOP (rentabilité ≥ {MIN_YIELD}%) :")
-        for l in qualified[:10]:
-            rented = "★ " if l.get("already_rented") else "  "
-            print(f"  {rented}{l['gross_yield_pct']:5.2f}% brut / {l.get('net_yield_pct','?')}% net"
-                  f" | {l.get('monthly_rent','?')}€/mois | {l.get('price','?')}€"
-                  f" | {(l.get('title') or '')[:40]}")
+    for l in qualified[:10]:
+        star = "★ " if l.get("already_rented") else "  "
+        print(f"  {star}{l['gross_yield_pct']:5.2f}% brut"
+              f" / {l.get('net_yield_pct','?')}% net"
+              f" | {l.get('rent_hc','?')} €/mois"
+              f" | {l.get('price','?')} €"
+              f" | {l.get('city','?')}"
+              f" | {(l.get('title') or '')[:30]}")
 
-    # 8. WhatsApp notification for new qualifying listings
+    # 8. WhatsApp
     if new_listings and WA_PHONE and WA_APIKEY:
-        msg_lines = [f"🏠 LeBonCoin — {len(new_listings)} nouvelle(s) annonce(s) ≥ {MIN_YIELD}% :"]
+        lines = [f"LeBonCoin — {len(new_listings)} nouvelle(s) >= {MIN_YIELD}% :"]
         for l in new_listings[:5]:
-            msg_lines.append(
-                f"• {l['gross_yield_pct']}% brut | {l.get('monthly_rent')}€/mois | {l.get('price')}€ | {l['url']}"
-            )
-        send_whatsapp("\n".join(msg_lines))
+            lines.append(f"• {l['gross_yield_pct']}% | {l.get('rent_hc')}€/mois"
+                         f" | {l.get('price')}€ | {l['url']}")
+        send_whatsapp("\n".join(lines))
     elif new_listings:
-        print(f"\n  💡 {len(new_listings)} nouvelle(s) annonce(s) — configurez WA_PHONE + WA_APIKEY dans .env pour les recevoir sur WhatsApp")
+        print(f"\n  {len(new_listings)} nouvelle(s) — configurez WA_PHONE + WA_APIKEY dans .env pour WhatsApp")
 
     # 9. Export
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    export_csv(unique, OUTPUT_DIR / f"toutes_annonces_{ts}.csv")
+    export_csv(unique, OUTPUT_DIR / f"annonces_{ts}.csv")
     export_html(unique, OUTPUT_DIR / f"rapport_{ts}.html", MIN_YIELD)
 
-    print(f"\n  Ouvrez le rapport dans votre navigateur :")
-    print(f"  {(OUTPUT_DIR / f'rapport_{ts}.html').resolve()}")
+    print(f"\n  Rapport : {(OUTPUT_DIR / f'rapport_{ts}.html').resolve()}")
 
 
 if __name__ == "__main__":
