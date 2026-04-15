@@ -14,6 +14,7 @@ import csv
 import json
 import math
 import os
+import random
 import re
 import sys
 import urllib.parse
@@ -40,6 +41,81 @@ SEEN_FILE  = Path("seen_urls.json")
 OUTPUT_DIR = Path(".")
 
 BLANK = "—"  # valeur manquante — JAMAIS estimée
+
+
+# ── Stealth antibot ───────────────────────────────────────────────
+
+# Script injecté dans chaque onglet avant le chargement de la page.
+# Masque les signatures Playwright/CDP détectables par LeBonCoin.
+_STEALTH_JS = """
+// 1. Masquer navigator.webdriver (principal marqueur d'automation)
+Object.defineProperty(navigator, 'webdriver', {get: () => false});
+
+// 2. Simuler des plugins natifs (absent en automation)
+Object.defineProperty(navigator, 'plugins', {
+  get: () => {
+    const arr = [
+      {name:'Chrome PDF Plugin', filename:'internal-pdf-viewer', description:'Portable Document Format'},
+      {name:'Chrome PDF Viewer', filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai', description:''},
+      {name:'Native Client', filename:'internal-nacl-plugin', description:''}
+    ];
+    arr.__proto__ = PluginArray.prototype;
+    return arr;
+  }
+});
+
+// 3. Langues françaises naturelles
+Object.defineProperty(navigator, 'languages', {
+  get: () => ['fr-FR', 'fr', 'en-US', 'en']
+});
+
+// 4. Simuler l'objet window.chrome (absent hors Chrome réel)
+if (!window.chrome) {
+  window.chrome = {
+    runtime: {},
+    loadTimes: function() {},
+    csi: function() {},
+    app: {}
+  };
+}
+
+// 5. Corriger navigator.permissions pour éviter la détection
+const _origQuery = window.navigator.permissions.query.bind(navigator.permissions);
+window.navigator.permissions.query = (params) =>
+  params.name === 'notifications'
+    ? Promise.resolve({state: Notification.permission})
+    : _origQuery(params);
+
+// 6. Masquer les propriétés CDP dans l'objet window
+delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+
+// 7. Simuler une résolution d'écran normale
+Object.defineProperty(screen, 'width',  {get: () => 1920});
+Object.defineProperty(screen, 'height', {get: () => 1080});
+"""
+
+
+async def apply_stealth(context) -> None:
+    """
+    Applique le script stealth au contexte du navigateur.
+    Injecté automatiquement dans TOUS les nouveaux onglets.
+    """
+    await context.add_init_script(_STEALTH_JS)
+    await context.set_extra_http_headers({
+        "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "sec-ch-ua": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Upgrade-Insecure-Requests": "1",
+    })
+
+
+def human_delay(min_ms: int = 800, max_ms: int = 2500) -> float:
+    """Délai aléatoire humain en ms — retourne la valeur pour wait_for_timeout."""
+    return random.randint(min_ms, max_ms)
 
 
 # ── Persistance des URLs déjà vues ────────────────────────────────
@@ -386,8 +462,10 @@ async def scrape_listing_detail(context, url: str) -> dict:
     }
     page = await context.new_page()
     try:
+        # Délai aléatoire avant chaque ouverture (comportement humain)
+        await page.wait_for_timeout(human_delay(600, 1800))
         await page.goto(url, wait_until="domcontentloaded")
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(human_delay(800, 2000))
 
         for sel in ["h1", "[data-qa-id='ad_title']", "[data-test-id='ad-title']"]:
             el = await page.query_selector(sel)
@@ -781,6 +859,10 @@ async def main():
             sys.exit(1)
 
         context = contexts[0]
+
+        # Appliquer stealth sur le contexte (couvre tous les nouveaux onglets)
+        await apply_stealth(context)
+
         pages = context.pages
         page = pages[0] if pages else await context.new_page()
 
@@ -851,6 +933,11 @@ async def main():
         for i, card in enumerate(unique_raw, 1):
             url = card.get("url", "")
             print(f"  [{i}/{len(unique_raw)}] {url[:70]}")
+            # Pause humaine toutes les 10 annonces (évite les patterns réguliers)
+            if i > 1 and i % 10 == 0:
+                pause = random.randint(3000, 6000)
+                print(f"    [pause {pause//1000}s — comportement humain]")
+                await page.wait_for_timeout(pause)
             detail = await scrape_listing_detail(context, url)
             merged = {**card, **{k: v for k, v in detail.items() if v is not None and v != BLANK}}
             result = enrich(merged)
