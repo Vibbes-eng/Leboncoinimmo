@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """
-LeBonCoin Analyzer — Phase 1 MVP (CDP)
-======================================
+LeBonCoin Analyzer — v2 (Anti-bot renforcé + rentabilité ≥ 10%)
+================================================================
 1. Lancez Chrome via lancer_chrome.bat (port 9222)
 2. Naviguez vers vos recherches sauvegardees OU une page de resultats
 3. Lancez : python leboncoin_analyzer.py
 
 Sortie : rapport HTML interactif + CSV + notification WhatsApp (optionnel)
+
+Améliorations v2 :
+- Stealth renforcé (canvas, WebGL, audio, timezone, hardware)
+- Rotation des User-Agents Chrome réels
+- Mouvements souris humains (courbes de Bézier)
+- Scroll naturel à la lecture
+- Cookies persistants entre sessions
+- Détection captcha/blocage avec pause
+- Extraction IA améliorée (loyer, rentabilité, estimation)
+- Filtre strict ≥ 10% rentabilité brute
 """
 
 import asyncio
@@ -29,96 +39,349 @@ from playwright.async_api import async_playwright
 # ── Configuration ─────────────────────────────────────────────────
 load_dotenv()
 
-CDP_PORT   = int(os.getenv("CDP_PORT", "9222"))
-MIN_YIELD  = float(os.getenv("MIN_YIELD", "10.0"))
-MAX_PRICE  = int(os.getenv("MAX_PRICE", "150000"))
+CDP_PORT        = int(os.getenv("CDP_PORT", "9222"))
+MIN_YIELD       = float(os.getenv("MIN_YIELD", "10.0"))
+MAX_PRICE       = int(os.getenv("MAX_PRICE", "150000"))
 WA_PHONE        = os.getenv("WA_PHONE", "").strip()
 WA_APIKEY       = os.getenv("WA_APIKEY", "").strip()
 ANTHROPIC_KEY   = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
-CDP_URL    = f"http://localhost:{CDP_PORT}"
-SEEN_FILE  = Path("seen_urls.json")
-OUTPUT_DIR = Path(".")
+CDP_URL        = f"http://localhost:{CDP_PORT}"
+SEEN_FILE      = Path("seen_urls.json")
+COOKIES_FILE   = Path("cookies.json")
+OUTPUT_DIR     = Path(".")
 
-BLANK = "—"  # valeur manquante — JAMAIS estimée
+BLANK = "—"
 
 
-# ── Stealth antibot ───────────────────────────────────────────────
+# ── User-Agents Chrome réels (rotation) ───────────────────────────
 
-# Script injecté dans chaque onglet avant le chargement de la page.
-# Masque les signatures Playwright/CDP détectables par LeBonCoin.
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.184 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.225 Safari/537.36",
+]
+
+_VIEWPORTS = [
+    {"width": 1920, "height": 1080},
+    {"width": 1680, "height": 1050},
+    {"width": 1536, "height": 864},
+    {"width": 1440, "height": 900},
+    {"width": 1366, "height": 768},
+]
+
+
+# ── Stealth JS v2 — fingerprint complet ───────────────────────────
+
 _STEALTH_JS = """
-// 1. Masquer navigator.webdriver (principal marqueur d'automation)
-Object.defineProperty(navigator, 'webdriver', {get: () => false});
+(function() {
+  'use strict';
 
-// 2. Simuler des plugins natifs (absent en automation)
-Object.defineProperty(navigator, 'plugins', {
-  get: () => {
-    const arr = [
-      {name:'Chrome PDF Plugin', filename:'internal-pdf-viewer', description:'Portable Document Format'},
-      {name:'Chrome PDF Viewer', filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai', description:''},
-      {name:'Native Client', filename:'internal-nacl-plugin', description:''}
-    ];
-    arr.__proto__ = PluginArray.prototype;
-    return arr;
-  }
-});
+  // 1. webdriver flag
+  Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 
-// 3. Langues françaises naturelles
-Object.defineProperty(navigator, 'languages', {
-  get: () => ['fr-FR', 'fr', 'en-US', 'en']
-});
-
-// 4. Simuler l'objet window.chrome (absent hors Chrome réel)
-if (!window.chrome) {
-  window.chrome = {
-    runtime: {},
-    loadTimes: function() {},
-    csi: function() {},
-    app: {}
+  // 2. Plugins natifs
+  const makePlugin = (name, desc, filename) => {
+    const plugin = Object.create(Plugin.prototype);
+    Object.defineProperty(plugin, 'name', {get: () => name});
+    Object.defineProperty(plugin, 'description', {get: () => desc});
+    Object.defineProperty(plugin, 'filename', {get: () => filename});
+    Object.defineProperty(plugin, 'length', {get: () => 0});
+    return plugin;
   };
-}
+  const plugins = [
+    makePlugin('Chrome PDF Plugin', 'Portable Document Format', 'internal-pdf-viewer'),
+    makePlugin('Chrome PDF Viewer', '', 'mhjfbmdgcfjbbpaeojofohoefgiehjai'),
+    makePlugin('Native Client', '', 'internal-nacl-plugin'),
+  ];
+  Object.defineProperty(navigator, 'plugins', {
+    get: () => {
+      const arr = [...plugins];
+      arr.__proto__ = PluginArray.prototype;
+      Object.defineProperty(arr, 'item', {value: (i) => arr[i]});
+      Object.defineProperty(arr, 'namedItem', {value: (n) => arr.find(p => p.name === n)});
+      return arr;
+    }
+  });
 
-// 5. Corriger navigator.permissions pour éviter la détection
-const _origQuery = window.navigator.permissions.query.bind(navigator.permissions);
-window.navigator.permissions.query = (params) =>
-  params.name === 'notifications'
-    ? Promise.resolve({state: Notification.permission})
-    : _origQuery(params);
+  // 3. Langues françaises
+  Object.defineProperty(navigator, 'languages', {get: () => ['fr-FR', 'fr', 'en-US', 'en']});
 
-// 6. Masquer les propriétés CDP dans l'objet window
-delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+  // 4. Chrome runtime object
+  if (!window.chrome) {
+    window.chrome = {
+      runtime: {
+        connect: () => {},
+        sendMessage: () => {},
+        onMessage: {addListener: () => {}, removeListener: () => {}},
+        id: 'chrome-extension'
+      },
+      loadTimes: () => ({
+        requestTime: Date.now() / 1000 - Math.random() * 0.3,
+        startLoadTime: Date.now() / 1000 - Math.random() * 0.5,
+        commitLoadTime: Date.now() / 1000 - Math.random() * 0.2,
+        finishDocumentLoadTime: Date.now() / 1000,
+        finishLoadTime: Date.now() / 1000 + Math.random() * 0.1,
+        firstPaintTime: Date.now() / 1000,
+        firstPaintAfterLoadTime: 0,
+        navigationType: 'Other',
+        wasFetchedViaSpdy: false,
+        wasNpnNegotiated: true,
+        npnNegotiatedProtocol: 'h2',
+        wasAlternateProtocolAvailable: false,
+        connectionInfo: 'h2'
+      }),
+      csi: () => ({
+        startE: Date.now(),
+        onloadT: Date.now() + Math.floor(Math.random() * 500 + 200),
+        pageT: Math.random() * 1000 + 500,
+        tran: 15
+      }),
+      app: {}
+    };
+  }
 
-// 7. Simuler une résolution d'écran normale
-Object.defineProperty(screen, 'width',  {get: () => 1920});
-Object.defineProperty(screen, 'height', {get: () => 1080});
+  // 5. Permissions API
+  try {
+    const origQuery = window.navigator.permissions.query.bind(navigator.permissions);
+    window.navigator.permissions.query = (params) => {
+      if (params.name === 'notifications') {
+        return Promise.resolve({state: Notification.permission, onchange: null});
+      }
+      return origQuery(params);
+    };
+  } catch(e) {}
+
+  // 6. Supprimer les propriétés CDP
+  ['cdc_adoQpoasnfa76pfcZLmcfl_Array',
+   'cdc_adoQpoasnfa76pfcZLmcfl_Promise',
+   'cdc_adoQpoasnfa76pfcZLmcfl_Symbol',
+   '__playwright_target__',
+   '__pw_manual',
+   '__PW_inspect'].forEach(k => { try { delete window[k]; } catch(e) {} });
+
+  // 7. Canvas fingerprint réaliste (bruit minimal)
+  const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+  HTMLCanvasElement.prototype.toDataURL = function(type) {
+    if (type === 'image/png' && this.width === 1 && this.height === 1) {
+      return origToDataURL.apply(this, arguments);
+    }
+    const ctx = this.getContext('2d');
+    if (ctx) {
+      const imgData = ctx.getImageData(0, 0, 1, 1);
+      imgData.data[0] = Math.max(0, imgData.data[0] - 1);
+      ctx.putImageData(imgData, 0, 0);
+    }
+    return origToDataURL.apply(this, arguments);
+  };
+
+  // 8. WebGL fingerprint
+  const getParameter = WebGLRenderingContext.prototype.getParameter;
+  WebGLRenderingContext.prototype.getParameter = function(parameter) {
+    if (parameter === 37445) return 'Intel Inc.';
+    if (parameter === 37446) return 'Intel(R) Iris(TM) Plus Graphics 640';
+    return getParameter.apply(this, [parameter]);
+  };
+  try {
+    const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+    WebGL2RenderingContext.prototype.getParameter = function(parameter) {
+      if (parameter === 37445) return 'Intel Inc.';
+      if (parameter === 37446) return 'Intel(R) Iris(TM) Plus Graphics 640';
+      return getParameter2.apply(this, [parameter]);
+    };
+  } catch(e) {}
+
+  // 9. AudioContext fingerprint
+  try {
+    const origGetChannelData = AudioBuffer.prototype.getChannelData;
+    AudioBuffer.prototype.getChannelData = function(channel) {
+      const data = origGetChannelData.call(this, channel);
+      if (data.length > 100) {
+        data[0] = data[0] + 0.0000001 * (Math.random() - 0.5);
+      }
+      return data;
+    };
+  } catch(e) {}
+
+  // 10. Navigator hardware concurrency réaliste
+  Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+  Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+  Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+  Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 0});
+
+  // 11. Screen réaliste (correspond au viewport choisi)
+  Object.defineProperty(screen, 'colorDepth', {get: () => 24});
+  Object.defineProperty(screen, 'pixelDepth', {get: () => 24});
+
+  // 12. Timezone Europe/Paris
+  const origDateGetTimezoneOffset = Date.prototype.getTimezoneOffset;
+  Date.prototype.getTimezoneOffset = function() { return -60; };
+
+  // 13. Battery API simulée
+  if (navigator.getBattery) {
+    navigator.getBattery = () => Promise.resolve({
+      charging: true, chargingTime: 0,
+      dischargingTime: Infinity, level: 0.98,
+      addEventListener: () => {}, removeEventListener: () => {}
+    });
+  }
+
+})();
 """
 
 
-async def apply_stealth(context) -> None:
+async def apply_stealth(context, ua: str = None, viewport: dict = None) -> None:
     """
-    Applique le script stealth au contexte du navigateur.
-    Injecté automatiquement dans TOUS les nouveaux onglets.
+    Stealth v2 : init script + headers complets + UA + viewport.
     """
+    chosen_ua = ua or random.choice(_USER_AGENTS)
+    chosen_vp = viewport or random.choice(_VIEWPORTS)
+
     await context.add_init_script(_STEALTH_JS)
+
+    # Version Chrome extraite du UA
+    ver_match = re.search(r"Chrome/(\d+)", chosen_ua)
+    chrome_ver = ver_match.group(1) if ver_match else "124"
+
     await context.set_extra_http_headers({
         "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "sec-ch-ua": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "sec-ch-ua": f'"Google Chrome";v="{chrome_ver}", "Chromium";v="{chrome_ver}", "Not-A.Brand";v="99"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua-platform-version": '"10.0.0"',
+        "sec-ch-ua-arch": '"x86"',
+        "sec-ch-ua-bitness": '"64"',
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "sec-fetch-user": "?1",
         "Upgrade-Insecure-Requests": "1",
+        "User-Agent": chosen_ua,
+        "DNT": "1",
     })
+
+    print(f"  [Stealth] UA: Chrome/{chrome_ver} | Viewport: {chosen_vp['width']}x{chosen_vp['height']}")
+
+
+# ── Mouvements souris humains ─────────────────────────────────────
+
+async def human_mouse_move(page, target_x: int = None, target_y: int = None) -> None:
+    """
+    Déplace la souris vers une cible en simulant une courbe de Bézier humaine.
+    Si pas de cible, mouvement aléatoire naturel.
+    """
+    vp = page.viewport_size or {"width": 1366, "height": 768}
+    w, h = vp["width"], vp["height"]
+
+    # Position de départ aléatoire
+    start_x = random.randint(100, w - 100)
+    start_y = random.randint(100, h - 100)
+
+    end_x = target_x or random.randint(200, w - 200)
+    end_y = target_y or random.randint(200, h - 200)
+
+    # Points de contrôle Bézier
+    cp1x = start_x + (end_x - start_x) * random.uniform(0.2, 0.4) + random.randint(-80, 80)
+    cp1y = start_y + (end_y - start_y) * random.uniform(0.1, 0.3) + random.randint(-80, 80)
+    cp2x = start_x + (end_x - start_x) * random.uniform(0.6, 0.8) + random.randint(-80, 80)
+    cp2y = start_y + (end_y - start_y) * random.uniform(0.7, 0.9) + random.randint(-80, 80)
+
+    steps = random.randint(15, 30)
+    for i in range(steps + 1):
+        t = i / steps
+        # Courbe de Bézier cubique
+        x = (1-t)**3*start_x + 3*(1-t)**2*t*cp1x + 3*(1-t)*t**2*cp2x + t**3*end_x
+        y = (1-t)**3*start_y + 3*(1-t)**2*t*cp1y + 3*(1-t)*t**2*cp2y + t**3*end_y
+        await page.mouse.move(int(x), int(y))
+        await page.wait_for_timeout(random.randint(10, 35))
+
+
+async def human_scroll(page, direction: str = "down") -> None:
+    """Scroll naturel avec accélération/décélération."""
+    total = random.randint(300, 800)
+    chunks = random.randint(4, 9)
+    per_chunk = total // chunks
+    for _ in range(chunks):
+        delta = per_chunk + random.randint(-30, 30)
+        await page.mouse.wheel(0, delta if direction == "down" else -delta)
+        await page.wait_for_timeout(random.randint(80, 220))
 
 
 def human_delay(min_ms: int = 800, max_ms: int = 2500) -> float:
-    """Délai aléatoire humain en ms — retourne la valeur pour wait_for_timeout."""
-    return random.randint(min_ms, max_ms)
+    """Délai aléatoire avec distribution non uniforme (plus probable vers le milieu)."""
+    # Distribution bêta pour simuler les réactions humaines
+    beta_sample = random.betavariate(2, 3)
+    return int(min_ms + beta_sample * (max_ms - min_ms))
 
 
-# ── Persistance des URLs déjà vues ────────────────────────────────
+# ── Persistance cookies ───────────────────────────────────────────
+
+async def save_cookies(context) -> None:
+    try:
+        cookies = await context.cookies()
+        COOKIES_FILE.write_text(json.dumps(cookies, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"  [Cookies] Sauvegarde échouée : {e}")
+
+
+async def load_cookies(context) -> None:
+    if not COOKIES_FILE.exists():
+        return
+    try:
+        cookies = json.loads(COOKIES_FILE.read_text(encoding="utf-8"))
+        # Filtrer les cookies expirés
+        now = datetime.now().timestamp()
+        valid = [c for c in cookies if c.get("expires", 0) == -1 or c.get("expires", 0) > now]
+        if valid:
+            await context.add_cookies(valid)
+            print(f"  [Cookies] {len(valid)} cookie(s) restauré(s)")
+    except Exception as e:
+        print(f"  [Cookies] Chargement échoué : {e}")
+
+
+# ── Détection captcha/blocage ─────────────────────────────────────
+
+async def detect_and_handle_block(page) -> bool:
+    """
+    Détecte les pages Cloudflare, captcha, ou blocage.
+    Retourne True si bloqué (avec pause pour résolution manuelle).
+    """
+    url = page.url
+    title = await page.title()
+    content = await page.content()
+
+    block_signals = [
+        "captcha" in url.lower(),
+        "challenge" in url.lower(),
+        "cloudflare" in content.lower() and "checking" in title.lower(),
+        "just a moment" in title.lower(),
+        "veuillez patienter" in title.lower(),
+        "accès refusé" in title.lower(),
+        "access denied" in title.lower(),
+        'id="challenge-form"' in content,
+        "cf-browser-verification" in content,
+        "__cf_chl" in content,
+        "robot" in content.lower() and "vérifier" in content.lower(),
+        "recaptcha" in content.lower(),
+    ]
+
+    if any(block_signals):
+        print("\n  ⚠️  BLOCAGE DÉTECTÉ (captcha/Cloudflare)")
+        print("  → Résolvez le captcha manuellement dans Chrome")
+        print("  → Appuyez sur ENTRÉE quand c'est fait...")
+        input()
+        await page.wait_for_load_state("networkidle")
+        # Sauvegarder les cookies après résolution
+        return True
+
+    return False
+
+
+# ── Persistance URLs vues ─────────────────────────────────────────
 
 def load_seen() -> set:
     if SEEN_FILE.exists():
@@ -139,12 +402,6 @@ def save_seen(seen: set) -> None:
 # ── Détection du type de page ─────────────────────────────────────
 
 async def detect_page_type(page) -> str:
-    """
-    Retourne :
-      'saved_searches' — page liste des recherches sauvegardées
-      'results'        — page de résultats d'annonces
-      'unknown'        — autre
-    """
     url = page.url
     if "mes-favoris/recherches" in url:
         return "saved_searches"
@@ -162,7 +419,6 @@ async def detect_page_type(page) -> str:
 # ── Extraction des recherches sauvegardées ────────────────────────
 
 async def get_saved_search_urls(page) -> list:
-    """Retourne les URLs de résultats de chaque recherche sauvegardée."""
     await page.wait_for_load_state("networkidle")
     urls = []
     selectors = [
@@ -183,7 +439,7 @@ async def get_saved_search_urls(page) -> list:
     return urls
 
 
-# ── Parsing d'une annonce individuelle ───────────────────────────
+# ── Parsing ───────────────────────────────────────────────────────
 
 def _text(el_text: str) -> str:
     return el_text.strip() if el_text else ""
@@ -205,23 +461,33 @@ def parse_surface(text: str):
     return None
 
 
-# ── Extraction IA des données financières ────────────────────────
+# ── Extraction IA v2 — prompt enrichi pour loyer + rentabilité ───
 
 _AI_PROMPT = """\
-Tu analyses une annonce immobilière française. Extrais les données financières.
+Tu analyses une annonce immobilière française pour un investisseur cherchant une rentabilité brute ≥ {min_yield}%.
 
 Prix affiché dans l'annonce : {price_hint}
+Surface approximative : {surface_hint}
+Localisation : {location_hint}
 
-Description :
+Description complète :
 {description}
 
-Règles IMPORTANTES :
-- Le prix de VENTE (ex: 145 000€, "prix de vente : X") n'est PAS le loyer — ne le confonds pas.
-- "740 X 12 = 8880€" signifie 740€/mois (le x12 est juste l'annualisation, utilise 740).
-- "CC" ou "charges comprises" = loyer incluant les charges → mettre dans loyer_cc, pas loyer_hc.
-- Si loyer HC ET charges connus : loyer_hc = loyer_cc - charges_mois.
-- Immeuble de rapport / plusieurs lots : additionne TOUS les loyers dans loyer_hc_total, liste-les dans loyer_detail.
-- Si aucune donnée pertinente : mettre null, ne PAS inventer.
+RÈGLES CRITIQUES D'EXTRACTION :
+1. Prix de VENTE ≠ loyer — ne jamais confondre.
+2. "740 x 12 = 8 880€" → loyer = 740€/mois (x12 = annualisation).
+3. CC = charges comprises → loyer_cc. HC = hors charges → loyer_hc.
+4. Si loyer_cc et charges connues : loyer_hc = loyer_cc - charges.
+5. Immeuble de rapport / plusieurs lots : additionne TOUS les loyers.
+6. Cherche aussi : "rapport locatif", "déjà loué", "bail en cours", "revenus locatifs".
+7. Si description parle de loyer potentiel/estimé/marché → loyer_potentiel (ne pas mettre dans loyer_hc).
+8. Ne JAMAIS inventer de données manquantes → mettre null.
+9. Si plusieurs loyers listés (ex: lot 1: 450€, lot 2: 380€) → les additionner pour loyer_hc.
+
+CALCUL RENTABILITÉ (informatif seulement — pas pour inventer des données) :
+- Rentabilité brute = (loyer_hc * 12) / (prix + frais_notaire) * 100
+- Frais de notaire anciens ≈ 8% du prix
+- Si rentabilité calculée < {min_yield}%, signaler dans notes.
 
 Retourne UNIQUEMENT ce JSON (sans texte autour) :
 {{
@@ -229,59 +495,72 @@ Retourne UNIQUEMENT ce JSON (sans texte autour) :
   "loyer_cc": <entier mensuel CC, ou null>,
   "charges_mois": <charges mensuelles entier, ou null>,
   "taxe_fonciere": <taxe foncière annuelle entier, ou null>,
+  "loyer_potentiel": <loyer marché estimé si mentionné, ou null>,
   "nb_lots": <nombre de logements (immeuble de rapport), sinon 1>,
   "loyer_detail": <liste des loyers individuels si >1 lot, sinon null>,
-  "loyer_source": "<'hc'|'cc'|'cc_moins_charges'|'calcule'|'inconnu'>",
-  "notes": "<explication courte en 1 ligne>"
+  "loyer_source": "<'hc'|'cc'|'cc_moins_charges'|'calcule'|'potentiel'|'inconnu'>",
+  "deja_loue": <true si déjà occupé par un locataire, false sinon>,
+  "bail_type": "<'vide'|'meuble'|'commercial'|'inconnu'>",
+  "rentabilite_brute_estimee": <float ou null — calculé si données suffisantes>,
+  "notes": "<explication courte en 1-2 lignes>"
 }}"""
 
 
-async def ai_extract_financials(description: str, price: int = None) -> dict:
-    """
-    Appelle Claude Haiku pour extraire intelligemment les données financières.
-    Retourne un dict vide si ANTHROPIC_API_KEY absent ou erreur.
-    """
+async def ai_extract_financials(description: str, price: int = None,
+                                 surface: float = None, location: str = None) -> dict:
     if not ANTHROPIC_KEY or not description or description == BLANK:
         return {}
 
-    price_hint = f"{price:,}€" if price else "non précisé"
+    price_hint    = f"{price:,}€".replace(",", " ") if price else "non précisé"
+    surface_hint  = f"{surface} m²" if surface else "non précisée"
+    location_hint = location or "non précisée"
+
     prompt = _AI_PROMPT.format(
+        min_yield=MIN_YIELD,
         price_hint=price_hint,
-        description=description[:2000],  # limiter les tokens
+        surface_hint=surface_hint,
+        location_hint=location_hint,
+        description=description[:3000],
     )
 
     try:
         client = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
         resp = await client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=500,
+            max_tokens=600,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = resp.content[0].text.strip()
-        # Extraire le JSON même si le modèle ajoute du texte autour
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if m:
-            data = json.loads(m.group())
-            return data
+            return json.loads(m.group())
     except Exception as e:
-        print(f"    [AI] Erreur extraction : {e}")
+        print(f"    [AI] Erreur : {e}")
 
     return {}
 
 
+# ── Fallbacks regex ───────────────────────────────────────────────
+
 def _regex_fallback_loyer(text: str):
-    """Fallback regex loyer — utilisé quand ANTHROPIC_API_KEY non configuré."""
     if not text:
         return None
-    for pat in [
-        r"loyer\s+hors\s+charges[^\d]*(\d[\d\s]*)",
-        r"loyer\s+hc[^\d]*(\d[\d\s]*)",
-        r"loyer[^\d]*(\d{3,4})\s*[€e]",
-    ]:
+    patterns = [
+        r"loyer\s+hors\s+charges[^\d]*(\d[\d\s]{2,5})",
+        r"loyer\s+hc[^\d]*(\d[\d\s]{2,5})",
+        r"loyer[^\d]*(\d{3,4})\s*[€e](?:\s*/\s*mois)?",
+        r"(\d{3,4})\s*[€e]\s*/\s*mois",
+        r"rapport\s+locatif[^\d]*(\d[\d\s]{2,5})[€e]",
+        r"revenus?\s+locatifs?[^\d]*(\d[\d\s]{2,5})[€e]",
+        r"loue[ée]?\s+\w*[^\d]*(\d{3,4})\s*[€e]",
+    ]
+    for pat in patterns:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
             try:
-                return int(re.sub(r"\s", "", m.group(1)))
+                val = int(re.sub(r"\s", "", m.group(1)))
+                if 200 <= val <= 5000:  # fourchette réaliste pour un loyer
+                    return val
             except ValueError:
                 pass
     return None
@@ -302,10 +581,12 @@ def _regex_fallback_taxe(text: str):
 def _regex_fallback_charges(text: str):
     if not text:
         return None
-    for pat in [
+    patterns = [
         r"charges[^\d]*(\d{2,3})\s*[€e]\s*/\s*mois",
         r"charges\s+mensuelles[^\d]*(\d{2,3})",
-    ]:
+        r"charges\s*:\s*(\d{2,3})\s*[€e]",
+    ]
+    for pat in patterns:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
             try:
@@ -355,13 +636,17 @@ def calc_yield_net(loyer_mensuel, prix_net, taxe_fonciere, charges_mensuelles):
     return round(revenus_nets / total * 100, 2)
 
 
-# ── Extraction des liens d'annonces via JavaScript ────────────────
+def loyer_min_pour_rendement(prix_net: int, target_yield: float = None) -> int:
+    """Calcule le loyer mensuel minimum pour atteindre le rendement cible."""
+    target = target_yield or MIN_YIELD
+    fn = frais_notaire(prix_net)
+    total = prix_net + fn
+    return math.ceil(total * target / 100 / 12)
+
+
+# ── Extraction des liens d'annonces ──────────────────────────────
 
 async def get_ad_links_from_page(page) -> list:
-    """
-    Extrait tous les liens d'annonces depuis le DOM de la page courante.
-    N'effectue AUCUNE navigation — travaille sur la page déjà chargée.
-    """
     links = await page.evaluate("""() => {
         const seen = new Set();
         const out = [];
@@ -385,17 +670,22 @@ async def get_ad_links_from_page(page) -> list:
 # ── Scraping d'une page de résultats ─────────────────────────────
 
 async def scrape_results_page(page) -> list:
-    """
-    Extrait les liens d'annonces de la page courante (déjà chargée dans Chrome).
-    Gère la pagination via clic sur "page suivante" (pas de page.goto).
-    """
     await page.wait_for_load_state("networkidle")
-    await page.wait_for_timeout(500)
+    await page.wait_for_timeout(human_delay(800, 1500))
+
+    # Scroll naturel pour simuler la lecture
+    await human_scroll(page, "down")
+    await page.wait_for_timeout(human_delay(400, 800))
+    await human_scroll(page, "down")
+    await page.wait_for_timeout(human_delay(300, 600))
 
     all_links = []
     page_num = 1
 
     while True:
+        # Mouvement de souris naturel
+        await human_mouse_move(page)
+
         links = await get_ad_links_from_page(page)
         new = [l for l in links if l not in all_links]
         all_links.extend(new)
@@ -413,15 +703,21 @@ async def scrape_results_page(page) -> list:
 
         prev_url = page.url
         try:
+            # Scroll vers le bouton avant de cliquer
+            await next_btn.scroll_into_view_if_needed()
+            await page.wait_for_timeout(human_delay(400, 900))
             await next_btn.click()
             await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(human_delay(1500, 3000))
         except Exception as e:
             print(f"  [WARN] Pagination page {page_num}: {e}")
             break
 
         if page.url == prev_url:
             break
+
+        # Vérifier blocage après navigation
+        await detect_and_handle_block(page)
         page_num += 1
 
     return [
@@ -444,10 +740,6 @@ async def scrape_results_page(page) -> list:
 # ── Scraping du détail d'une annonce ─────────────────────────────
 
 async def scrape_listing_detail(context, url: str) -> dict:
-    """
-    Ouvre l'annonce dans un NOUVEL onglet, scrape, ferme l'onglet.
-    La page de résultats reste intacte dans Chrome.
-    """
     data = {
         "url": url,
         "title": BLANK,
@@ -459,50 +751,82 @@ async def scrape_listing_detail(context, url: str) -> dict:
         "charges": None,
         "nb_pieces": None,
         "description": BLANK,
+        "deja_loue": False,
+        "bail_type": "inconnu",
+        "loyer_potentiel": None,
     }
     page = await context.new_page()
     try:
-        # Délai aléatoire avant chaque ouverture (comportement humain)
-        await page.wait_for_timeout(human_delay(600, 1800))
-        await page.goto(url, wait_until="domcontentloaded")
-        await page.wait_for_timeout(human_delay(800, 2000))
+        await page.wait_for_timeout(human_delay(700, 1800))
 
+        # Mouvement souris avant navigation
+        await human_mouse_move(page)
+
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(human_delay(1000, 2500))
+
+        # Vérifier le blocage
+        blocked = await detect_and_handle_block(page)
+        if blocked:
+            # Réessayer après résolution manuelle
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(human_delay(1500, 3000))
+
+        # Scroll naturel pour simuler la lecture de l'annonce
+        await human_scroll(page, "down")
+        await page.wait_for_timeout(human_delay(500, 1200))
+        await human_scroll(page, "down")
+        await page.wait_for_timeout(human_delay(300, 800))
+
+        # Titre
         for sel in ["h1", "[data-qa-id='ad_title']", "[data-test-id='ad-title']"]:
             el = await page.query_selector(sel)
             if el:
                 data["title"] = _text(await el.inner_text())
                 break
 
-        for sel in ["[data-qa-id='adview_price']", "[data-test-id='ad-price']", "[class*='price']"]:
+        # Prix
+        for sel in [
+            "[data-qa-id='adview_price']",
+            "[data-test-id='ad-price']",
+            "[class*='price']",
+            "span[class*='Price']",
+        ]:
             el = await page.query_selector(sel)
             if el:
                 data["price"] = parse_price(_text(await el.inner_text()))
                 if data["price"]:
                     break
 
+        # Localisation
         for sel in [
             "[data-qa-id='adview_location_informations']",
             "[data-test-id='ad-location']",
             "[class*='location']",
+            "[class*='Location']",
         ]:
             el = await page.query_selector(sel)
             if el:
                 data["location"] = _text(await el.inner_text()).split("\n")[0]
                 break
 
+        # Description
         for sel in [
             "[data-qa-id='adview_description_container']",
             "[data-test-id='ad-description']",
             "[class*='description']",
+            "[class*='Description']",
+            "div[itemprop='description']",
         ]:
             el = await page.query_selector(sel)
             if el:
                 data["description"] = _text(await el.inner_text())
                 break
 
+        # Attributs (surface, pièces)
         attr_els = await page.query_selector_all(
             "[data-qa-id='criteria_item'], [data-test-id='criteria-item'], "
-            "[class*='criteria'], [class*='attribute']"
+            "[class*='criteria'], [class*='attribute'], [class*='Criteria']"
         )
         for attr_el in attr_els:
             text = _text(await attr_el.inner_text()).lower()
@@ -518,39 +842,52 @@ async def scrape_listing_detail(context, url: str) -> dict:
         full_text = data["description"] or ""
 
         # ── Extraction IA (prioritaire) ──────────────────────────────
-        ai = await ai_extract_financials(full_text, data.get("price"))
+        ai = await ai_extract_financials(
+            full_text,
+            data.get("price"),
+            data.get("surface"),
+            data.get("location"),
+        )
         if ai:
-            # Résoudre loyer_hc depuis les données IA
-            loyer_hc = ai.get("loyer_hc")
-            loyer_cc = ai.get("loyer_cc")
-            charges_ai = ai.get("charges_mois")
+            loyer_hc     = ai.get("loyer_hc")
+            loyer_cc     = ai.get("loyer_cc")
+            charges_ai   = ai.get("charges_mois")
+            loyer_pot    = ai.get("loyer_potentiel")
 
             if loyer_hc:
                 data["loyer"] = loyer_hc
             elif loyer_cc and charges_ai:
-                data["loyer"] = loyer_cc - charges_ai  # CC - charges = HC
+                data["loyer"] = loyer_cc - charges_ai
             elif loyer_cc:
-                # CC sans détail charges → on l'utilise mais on le signale
                 data["loyer"] = loyer_cc
+
+            # Si pas de loyer courant mais loyer potentiel mentionné
+            if data["loyer"] is None and loyer_pot:
+                data["loyer"] = loyer_pot
+                ai["loyer_source"] = "potentiel"
 
             if ai.get("taxe_fonciere"):
                 data["taxe_fonciere"] = ai["taxe_fonciere"]
             if charges_ai:
                 data["charges"] = charges_ai
 
-            # Champs supplémentaires IA
-            data["nb_lots"]       = ai.get("nb_lots", 1) or 1
-            data["loyer_detail"]  = ai.get("loyer_detail")   # liste ou None
-            data["loyer_source"]  = ai.get("loyer_source", "inconnu")
-            data["ai_notes"]      = ai.get("notes", "")
+            data["nb_lots"]        = ai.get("nb_lots", 1) or 1
+            data["loyer_detail"]   = ai.get("loyer_detail")
+            data["loyer_source"]   = ai.get("loyer_source", "inconnu")
+            data["ai_notes"]       = ai.get("notes", "")
+            data["deja_loue"]      = ai.get("deja_loue", False)
+            data["bail_type"]      = ai.get("bail_type", "inconnu")
+            data["loyer_potentiel"] = loyer_pot
 
             if data["loyer"]:
                 src = data["loyer_source"]
+                rdt = ai.get("rentabilite_brute_estimee", "")
                 print(f"    [AI] loyer={data['loyer']}€/mois ({src})"
+                      + (f" | rdt≈{rdt}%" if rdt else "")
                       + (f" | {data['nb_lots']} lots" if data["nb_lots"] > 1 else "")
-                      + (f" | {data['ai_notes'][:60]}" if data["ai_notes"] else ""))
+                      + (f" | {str(data['ai_notes'])[:60]}" if data["ai_notes"] else ""))
         else:
-            # ── Fallback regex si pas de clé API ──────────────────────
+            # ── Fallback regex ────────────────────────────────────────
             if data["loyer"] is None:
                 data["loyer"] = _regex_fallback_loyer(full_text)
             if data["taxe_fonciere"] is None:
@@ -573,14 +910,17 @@ async def scrape_listing_detail(context, url: str) -> dict:
 # ── Filtre et enrichissement ──────────────────────────────────────
 
 def enrich(listing: dict):
-    price  = listing.get("price")
-    loyer  = listing.get("loyer")
+    price = listing.get("price")
+    loyer = listing.get("loyer")
 
     if price is None:
         return None
     if price > MAX_PRICE:
         return None
     if loyer is None:
+        # Calculer le loyer minimum nécessaire pour infomer l'utilisateur
+        loyer_min = loyer_min_pour_rendement(price)
+        print(f"    → Loyer non trouvé. Loyer min pour {MIN_YIELD}% brut : {loyer_min}€/mois")
         return None
 
     fn         = frais_notaire(price)
@@ -588,10 +928,13 @@ def enrich(listing: dict):
     yield_brut = calc_yield_brut(loyer, price)
 
     if yield_brut is None or yield_brut < MIN_YIELD:
+        if yield_brut is not None:
+            loyer_min = loyer_min_pour_rendement(price)
+            print(f"    → Rdt brut {yield_brut}% < {MIN_YIELD}% (loyer min : {loyer_min}€/mois)")
         return None
 
-    taxe    = listing.get("taxe_fonciere")
-    charges = listing.get("charges")
+    taxe      = listing.get("taxe_fonciere")
+    charges   = listing.get("charges")
     yield_net = calc_yield_net(loyer, price, taxe, charges)
 
     surface   = listing.get("surface")
@@ -599,22 +942,23 @@ def enrich(listing: dict):
     loyer_m2  = round(loyer / surface, 2) if surface else None
 
     nb_lots      = listing.get("nb_lots", 1) or 1
-    loyer_detail = listing.get("loyer_detail")  # liste ou None
+    loyer_detail = listing.get("loyer_detail")
     loyer_source = listing.get("loyer_source", BLANK)
     ai_notes     = listing.get("ai_notes", "")
+    deja_loue    = listing.get("deja_loue", False)
+    bail_type    = listing.get("bail_type", "inconnu")
 
-    # Label loyer source pour l'affichage HTML
     source_labels = {
         "hc":              "HC extrait",
         "cc_moins_charges":"CC − charges",
         "cc":              "CC (charges incluses)",
         "calcule":         "Calculé",
+        "potentiel":       "Potentiel estimé",
         "regex":           "Regex (sans IA)",
         "inconnu":         BLANK,
     }
     loyer_label = source_labels.get(loyer_source, loyer_source)
 
-    # Détail multi-lots en texte lisible
     lots_str = BLANK
     if loyer_detail and isinstance(loyer_detail, list) and len(loyer_detail) > 1:
         lots_str = " + ".join(f"{v}€" for v in loyer_detail) + f" = {loyer}€"
@@ -638,6 +982,8 @@ def enrich(listing: dict):
         "charges_mois":    charges or BLANK,
         "rendement_brut":  yield_brut,
         "rendement_net":   yield_net or BLANK,
+        "deja_loue":       "Oui" if deja_loue else "Non",
+        "bail_type":       bail_type if bail_type != "inconnu" else BLANK,
         "ai_notes":        ai_notes[:120] if ai_notes else BLANK,
         "description":     (listing.get("description") or BLANK)[:300],
         "nouveau":         False,
@@ -662,6 +1008,9 @@ tr:hover td{background:#fff8f8}
 tr.nouveau td{background:#fffde7}
 .badge-new{background:#ff9800;color:#fff;padding:2px 7px;border-radius:10px;
            font-size:11px;font-weight:bold;margin-left:6px}
+.badge-loue{background:#2d6a4f;color:#fff;padding:2px 7px;border-radius:10px;
+            font-size:11px;font-weight:bold;margin-left:4px}
+.yield-top{color:#1a5c35;font-weight:bold;font-size:14px}
 .yield-high{color:#2d6a4f;font-weight:bold}
 .yield-med{color:#e07800;font-weight:bold}
 input[type=text]{padding:6px 10px;border:1px solid #ccc;border-radius:4px;
@@ -669,10 +1018,12 @@ input[type=text]{padding:6px 10px;border:1px solid #ccc;border-radius:4px;
 button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;
        background:#e63946;color:#fff}
 button:hover{background:#c1121f}
-.filters{margin-bottom:12px}
+.filters{margin-bottom:12px;background:#fff;padding:12px;border-radius:8px;
+         box-shadow:0 1px 4px rgba(0,0,0,.1)}
 a{color:#e63946;text-decoration:none}
 a:hover{text-decoration:underline}
 .desc{color:#555;font-size:12px;max-width:280px}
+.badge-potentiel{background:#9b59b6;color:#fff;padding:1px 5px;border-radius:8px;font-size:10px}
 </style>"""
 
 HTML_SCRIPT = """<script>
@@ -694,10 +1045,13 @@ function filterTable(){
   const q=document.getElementById('search').value.toLowerCase();
   const minY=parseFloat(document.getElementById('minYield').value)||0;
   const maxP=parseFloat(document.getElementById('maxPrice').value)||Infinity;
+  const onlyLoue=document.getElementById('onlyLoue').checked;
   for(const r of document.getElementById('tbl').tBodies[0].rows){
     const y=parseFloat(r.cells[16].dataset.val)||0;
     const p=parseFloat(r.cells[5].dataset.val)||0;
-    r.style.display=r.innerText.toLowerCase().includes(q)&&y>=minY&&p<=maxP?'':'none';
+    const loue=r.cells[18].innerText.includes('Oui');
+    const match=r.innerText.toLowerCase().includes(q)&&y>=minY&&p<=maxP;
+    r.style.display=(match&&(!onlyLoue||loue))?'':'none';
   }
 }
 </script>"""
@@ -716,7 +1070,14 @@ def fmt(val, suffix="", decimals=None):
 def yclass(y):
     if y == BLANK or y is None:
         return ""
-    return "yield-high" if float(y) >= 12 else "yield-med" if float(y) >= 10 else ""
+    yf = float(y)
+    if yf >= 15:
+        return "yield-top"
+    if yf >= 12:
+        return "yield-high"
+    if yf >= 10:
+        return "yield-med"
+    return ""
 
 
 def export_html(listings: list, path: Path) -> None:
@@ -725,14 +1086,16 @@ def export_html(listings: list, path: Path) -> None:
         "Prix net", "Frais notaire", "Coût total", "Prix/m²",
         "Lots", "Loyer HC", "Détail loyers", "Source loyer", "Loyer/m²",
         "Taxe foncière", "Charges/mois",
-        "Rdt brut", "Rdt net",
+        "Rdt brut ≥10%", "Rdt net",
+        "Déjà loué", "Type bail",
         "Notes IA", "Description", "Date scraping",
     ]
     ths = "".join(f'<th onclick="sortTable({i})">{h} ⇅</th>' for i, h in enumerate(headers))
 
     rows = []
     for i, l in enumerate(listings, 1):
-        badge = '<span class="badge-new">NOUVEAU</span>' if l.get("nouveau") else ""
+        badge_new  = '<span class="badge-new">NOUVEAU</span>' if l.get("nouveau") else ""
+        badge_loue = '<span class="badge-loue">LOUÉ</span>' if l.get("deja_loue") == "Oui" else ""
         tr_cls = " class='nouveau'" if l.get("nouveau") else ""
 
         def c(val, suf="", dec=None, dv=None):
@@ -741,14 +1104,20 @@ def export_html(listings: list, path: Path) -> None:
 
         yb, yn = l["rendement_brut"], l["rendement_net"]
 
-        # Badge source loyer
         src = l.get("loyer_source", BLANK)
-        src_color = {"CC (charges incluses)": "#e07800", "Regex (sans IA)": "#888"}.get(src, "#2d6a4f")
+        src_colors = {
+            "HC extrait": "#2d6a4f",
+            "CC − charges": "#1a6ba0",
+            "CC (charges incluses)": "#e07800",
+            "Potentiel estimé": "#9b59b6",
+            "Regex (sans IA)": "#888",
+        }
+        src_color = src_colors.get(src, "#555")
         src_badge = f'<span style="font-size:10px;color:{src_color};font-weight:bold">{src}</span>' if src != BLANK else fmt(BLANK)
 
         rows.append(f"""<tr{tr_cls}>
 <td>{i}</td>
-<td><a href="{l['url']}" target="_blank">{str(l['titre'])[:50]}{badge}</a></td>
+<td><a href="{l['url']}" target="_blank">{str(l['titre'])[:50]}{badge_new}{badge_loue}</a></td>
 <td>{l['ville']}</td>
 {c(l['nb_pieces'])}{c(l['surface_m2'],' m²')}
 {c(l['prix_net'],' €',dv=l['prix_net'])}{c(l['frais_notaire'],' €')}{c(l['cout_total'],' €')}
@@ -761,35 +1130,42 @@ def export_html(listings: list, path: Path) -> None:
 {c(l['taxe_fonciere'],' €/an')}{c(l['charges_mois'],' €/mois')}
 <td data-val="{yb if yb!=BLANK else ''}"><span class="{yclass(yb)}">{fmt(yb,'%',2)}</span></td>
 <td data-val="{yn if yn!=BLANK else ''}"><span class="{yclass(yn)}">{fmt(yn,'%',2)}</span></td>
+<td>{l.get('deja_loue', BLANK)}</td>
+<td>{l.get('bail_type', BLANK)}</td>
 <td class="desc" style="font-size:11px;color:#666">{l.get('ai_notes',BLANK) if l.get('ai_notes',BLANK)!=BLANK else fmt(BLANK)}</td>
 <td class="desc">{str(l['description'])[:200]}</td>
 <td>{l.get('date_scraping',BLANK)}</td>
 </tr>""")
 
-    total = len(listings)
-    bruts = [l["rendement_brut"] for l in listings if isinstance(l["rendement_brut"], float)]
-    avg = round(sum(bruts) / len(bruts), 2) if bruts else 0
+    total  = len(listings)
+    bruts  = [l["rendement_brut"] for l in listings if isinstance(l["rendement_brut"], float)]
+    avg    = round(sum(bruts) / len(bruts), 2) if bruts else 0
+    top    = max(bruts) if bruts else 0
     nouveaux = sum(1 for l in listings if l.get("nouveau"))
+    loues    = sum(1 for l in listings if l.get("deja_loue") == "Oui")
 
     html = f"""<!DOCTYPE html>
 <html lang="fr">
 <head><meta charset="utf-8">
-<title>LeBonCoin — Analyse immobilière</title>
+<title>LeBonCoin — Analyse immobilière ≥{MIN_YIELD}% brut</title>
 {HTML_STYLE}
 </head>
 <body>
-<h1>LeBonCoin — Analyse immobilière</h1>
+<h1>LeBonCoin — Biens rentables ≥ {MIN_YIELD}% brut</h1>
 <div class="stats">
 <strong>{total}</strong> bien(s) &nbsp;|&nbsp;
 Rdt brut moyen : <strong>{avg}%</strong> &nbsp;|&nbsp;
+Meilleur : <strong class="yield-top">{top}%</strong> &nbsp;|&nbsp;
 Nouveaux : <strong>{nouveaux}</strong> &nbsp;|&nbsp;
+Déjà loués : <strong>{loues}</strong> &nbsp;|&nbsp;
 {datetime.now().strftime("%d/%m/%Y %H:%M")}
 </div>
 <div class="filters">
 <input type="text" id="search" placeholder="Rechercher…" oninput="filterTable()">
-<input type="text" id="minYield" placeholder="Rdt min (%)" oninput="filterTable()" style="width:120px">
-<input type="text" id="maxPrice" placeholder="Prix max (€)" oninput="filterTable()" style="width:120px">
-<button onclick="filterTable()">Filtrer</button>
+<input type="text" id="minYield" placeholder="Rdt min (%)" oninput="filterTable()" style="width:120px" value="{MIN_YIELD}">
+<input type="text" id="maxPrice" placeholder="Prix max (€)" oninput="filterTable()" style="width:130px" value="{MAX_PRICE}">
+<label style="margin-left:12px"><input type="checkbox" id="onlyLoue" onchange="filterTable()"> Déjà loué uniquement</label>
+<button onclick="filterTable()" style="margin-left:8px">Filtrer</button>
 </div>
 <table id="tbl">
 <thead><tr>{ths}</tr></thead>
@@ -835,7 +1211,7 @@ def send_whatsapp(message: str) -> None:
 
 async def main():
     print("=" * 60)
-    print(" LeBonCoin Analyzer — Phase 1 MVP (CDP)")
+    print(" LeBonCoin Analyzer v2 — Anti-bot renforcé")
     print("=" * 60)
     print(f" Filtres : prix <= {MAX_PRICE:,} EUR | rendement brut >= {MIN_YIELD}%")
     print(f" CDP     : {CDP_URL}")
@@ -860,11 +1236,19 @@ async def main():
 
         context = contexts[0]
 
-        # Appliquer stealth sur le contexte (couvre tous les nouveaux onglets)
-        await apply_stealth(context)
+        # Charger les cookies persistants
+        await load_cookies(context)
+
+        # Stealth avec UA et viewport aléatoires
+        ua  = random.choice(_USER_AGENTS)
+        vp  = random.choice(_VIEWPORTS)
+        await apply_stealth(context, ua, vp)
 
         pages = context.pages
         page = pages[0] if pages else await context.new_page()
+
+        # Vérifier si la page est bloquée au démarrage
+        await detect_and_handle_block(page)
 
         page_type = await detect_page_type(page)
         print(f" Page detectee : {page_type} ({page.url[:80]})")
@@ -897,25 +1281,26 @@ async def main():
 
         print()
 
-        # Scraping — pas de navigation sur la page courante
+        # Scraping
         all_raw = []
         if page_type == "results" and result_urls and page.url == result_urls[0]:
-            # Page déjà chargée par l'utilisateur : extraction directe sans goto()
-            print(f"Extraction sans navigation (page déjà chargée)...")
+            print(f"Extraction sans navigation (page deja chargee)...")
             cards = await scrape_results_page(page)
             all_raw.extend(cards)
         else:
-            # Recherches sauvegardées ou changement de page nécessaire
             for target_url in result_urls:
                 print(f"Navigation vers : {target_url[:80]}")
                 if page.url != target_url:
                     await page.goto(target_url, wait_until="networkidle")
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(human_delay(2000, 4000))
+                    await detect_and_handle_block(page)
                 cards = await scrape_results_page(page)
                 all_raw.extend(cards)
 
-        print(f"  {len(all_raw)} lien(s) d'annonces trouvé(s) au total")
+        # Sauvegarder les cookies après scraping de la liste
+        await save_cookies(context)
 
+        print(f"  {len(all_raw)} lien(s) d'annonces trouve(s) au total")
         print(f"\nTotal brut : {len(all_raw)}")
         print("Visite des details et filtrage...\n")
 
@@ -927,20 +1312,29 @@ async def main():
                 seen_batch[l["url"]] = True
                 unique_raw.append(l)
 
-        enriched = []
+        enriched     = []
         new_listings = []
 
         for i, card in enumerate(unique_raw, 1):
             url = card.get("url", "")
             print(f"  [{i}/{len(unique_raw)}] {url[:70]}")
-            # Pause humaine toutes les 10 annonces (évite les patterns réguliers)
-            if i > 1 and i % 10 == 0:
-                pause = random.randint(3000, 6000)
+
+            # Pause humaine longue toutes les 8 annonces
+            if i > 1 and i % 8 == 0:
+                pause = random.randint(4000, 9000)
                 print(f"    [pause {pause//1000}s — comportement humain]")
                 await page.wait_for_timeout(pause)
+
+            # Pause aléatoire très longue toutes les 25 annonces (simuler une pause café)
+            if i > 1 and i % 25 == 0:
+                pause = random.randint(15000, 30000)
+                print(f"    [pause longue {pause//1000}s — simulation pause]")
+                await page.wait_for_timeout(pause)
+
             detail = await scrape_listing_detail(context, url)
             merged = {**card, **{k: v for k, v in detail.items() if v is not None and v != BLANK}}
             result = enrich(merged)
+
             if result is None:
                 print("    x Hors criteres")
                 continue
@@ -952,15 +1346,19 @@ async def main():
                 seen.add(url)
 
             enriched.append(result)
-            print(f"    OK {result['prix_net']:,} EUR | loyer {result['loyer_hc']} EUR/mois | brut {result['rendement_brut']}%")
+            loue_str = " [LOUE]" if result.get("deja_loue") == "Oui" else ""
+            print(f"    OK {result['prix_net']:,} EUR | loyer {result['loyer_hc']} EUR/mois | brut {result['rendement_brut']}%{loue_str}")
+
+        # Sauvegarder les cookies à la fin
+        await save_cookies(context)
 
         enriched.sort(key=lambda x: x["rendement_brut"], reverse=True)
 
         print(f"\n{'='*60}")
-        print(f" {len(enriched)} bien(s) retenu(s) | {len(new_listings)} nouveau(x)")
+        print(f" {len(enriched)} bien(s) retenu(s) >= {MIN_YIELD}% brut | {len(new_listings)} nouveau(x)")
         print(f"{'='*60}\n")
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
         html_path = OUTPUT_DIR / f"rapport_{ts}.html"
         csv_path  = OUTPUT_DIR / f"rapport_{ts}.csv"
 
@@ -970,7 +1368,8 @@ async def main():
         if new_listings and WA_PHONE and WA_APIKEY:
             lines = [f"LeBonCoin — {len(new_listings)} nouveau(x) bien(s) >= {MIN_YIELD}% brut :"]
             for l in new_listings[:5]:
-                lines.append(f"* {l['ville']} — {l['prix_net']:,}EUR — {l['rendement_brut']}% brut")
+                loue = " [LOUE]" if l.get("deja_loue") == "Oui" else ""
+                lines.append(f"* {l['ville']} — {l['prix_net']:,}EUR — {l['rendement_brut']}% brut{loue}")
             if len(new_listings) > 5:
                 lines.append(f"...et {len(new_listings)-5} autre(s). Voir rapport HTML.")
             send_whatsapp("\n".join(lines))

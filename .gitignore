@@ -1,5 +1,6 @@
 # Credentials - NEVER commit
 .env
+cookies.json
 
 # Output files
 output/
