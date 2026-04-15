@@ -21,6 +21,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+import anthropic as _anthropic
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
@@ -30,8 +31,9 @@ load_dotenv()
 CDP_PORT   = int(os.getenv("CDP_PORT", "9222"))
 MIN_YIELD  = float(os.getenv("MIN_YIELD", "10.0"))
 MAX_PRICE  = int(os.getenv("MAX_PRICE", "150000"))
-WA_PHONE   = os.getenv("WA_PHONE", "").strip()
-WA_APIKEY  = os.getenv("WA_APIKEY", "").strip()
+WA_PHONE        = os.getenv("WA_PHONE", "").strip()
+WA_APIKEY       = os.getenv("WA_APIKEY", "").strip()
+ANTHROPIC_KEY   = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
 CDP_URL    = f"http://localhost:{CDP_PORT}"
 SEEN_FILE  = Path("seen_urls.json")
@@ -127,52 +129,111 @@ def parse_surface(text: str):
     return None
 
 
-def parse_loyer(text: str):
+# ── Extraction IA des données financières ────────────────────────
+
+_AI_PROMPT = """\
+Tu analyses une annonce immobilière française. Extrais les données financières.
+
+Prix affiché dans l'annonce : {price_hint}
+
+Description :
+{description}
+
+Règles IMPORTANTES :
+- Le prix de VENTE (ex: 145 000€, "prix de vente : X") n'est PAS le loyer — ne le confonds pas.
+- "740 X 12 = 8880€" signifie 740€/mois (le x12 est juste l'annualisation, utilise 740).
+- "CC" ou "charges comprises" = loyer incluant les charges → mettre dans loyer_cc, pas loyer_hc.
+- Si loyer HC ET charges connus : loyer_hc = loyer_cc - charges_mois.
+- Immeuble de rapport / plusieurs lots : additionne TOUS les loyers dans loyer_hc_total, liste-les dans loyer_detail.
+- Si aucune donnée pertinente : mettre null, ne PAS inventer.
+
+Retourne UNIQUEMENT ce JSON (sans texte autour) :
+{{
+  "loyer_hc": <entier mensuel HC, ou null>,
+  "loyer_cc": <entier mensuel CC, ou null>,
+  "charges_mois": <charges mensuelles entier, ou null>,
+  "taxe_fonciere": <taxe foncière annuelle entier, ou null>,
+  "nb_lots": <nombre de logements (immeuble de rapport), sinon 1>,
+  "loyer_detail": <liste des loyers individuels si >1 lot, sinon null>,
+  "loyer_source": "<'hc'|'cc'|'cc_moins_charges'|'calcule'|'inconnu'>",
+  "notes": "<explication courte en 1 ligne>"
+}}"""
+
+
+async def ai_extract_financials(description: str, price: int = None) -> dict:
+    """
+    Appelle Claude Haiku pour extraire intelligemment les données financières.
+    Retourne un dict vide si ANTHROPIC_API_KEY absent ou erreur.
+    """
+    if not ANTHROPIC_KEY or not description or description == BLANK:
+        return {}
+
+    price_hint = f"{price:,}€" if price else "non précisé"
+    prompt = _AI_PROMPT.format(
+        price_hint=price_hint,
+        description=description[:2000],  # limiter les tokens
+    )
+
+    try:
+        client = _anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
+        resp = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = resp.content[0].text.strip()
+        # Extraire le JSON même si le modèle ajoute du texte autour
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            data = json.loads(m.group())
+            return data
+    except Exception as e:
+        print(f"    [AI] Erreur extraction : {e}")
+
+    return {}
+
+
+def _regex_fallback_loyer(text: str):
+    """Fallback regex loyer — utilisé quand ANTHROPIC_API_KEY non configuré."""
     if not text:
         return None
-    patterns = [
-        r"loyer[^\d]*(\d[\d\s]*)\s*[€e]",
-        r"(\d[\d\s]*)\s*[€e]\s*/\s*mois",
-        r"(\d[\d\s]*)\s*[€e]\s*par\s*mois",
-    ]
-    for pat in patterns:
+    for pat in [
+        r"loyer\s+hors\s+charges[^\d]*(\d[\d\s]*)",
+        r"loyer\s+hc[^\d]*(\d[\d\s]*)",
+        r"loyer[^\d]*(\d{3,4})\s*[€e]",
+    ]:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            val = re.sub(r"\s", "", m.group(1))
             try:
-                return int(val)
+                return int(re.sub(r"\s", "", m.group(1)))
             except ValueError:
                 pass
     return None
 
 
-def parse_taxe_fonciere(text: str):
+def _regex_fallback_taxe(text: str):
     if not text:
         return None
     m = re.search(r"taxe\s+fonci[eè]re[^\d]*(\d[\d\s]*)\s*[€e]", text, re.IGNORECASE)
     if m:
-        val = re.sub(r"\s", "", m.group(1))
         try:
-            return int(val)
+            return int(re.sub(r"\s", "", m.group(1)))
         except ValueError:
             pass
     return None
 
 
-def parse_charges(text: str):
+def _regex_fallback_charges(text: str):
     if not text:
         return None
-    patterns = [
-        r"charges[^\d]*(\d[\d\s]*)\s*[€e]\s*/\s*mois",
-        r"charges\s+mensuelles[^\d]*(\d[\d\s]*)",
-        r"(\d[\d\s]*)\s*[€e]\s*de\s*charges",
-    ]
-    for pat in patterns:
+    for pat in [
+        r"charges[^\d]*(\d{2,3})\s*[€e]\s*/\s*mois",
+        r"charges\s+mensuelles[^\d]*(\d{2,3})",
+    ]:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            val = re.sub(r"\s", "", m.group(1))
             try:
-                return int(val)
+                return int(re.sub(r"\s", "", m.group(1)))
             except ValueError:
                 pass
     return None
@@ -377,12 +438,51 @@ async def scrape_listing_detail(context, url: str) -> dict:
                     data["nb_pieces"] = int(m.group(1))
 
         full_text = data["description"] or ""
-        if data["loyer"] is None:
-            data["loyer"] = parse_loyer(full_text)
-        if data["taxe_fonciere"] is None:
-            data["taxe_fonciere"] = parse_taxe_fonciere(full_text)
-        if data["charges"] is None:
-            data["charges"] = parse_charges(full_text)
+
+        # ── Extraction IA (prioritaire) ──────────────────────────────
+        ai = await ai_extract_financials(full_text, data.get("price"))
+        if ai:
+            # Résoudre loyer_hc depuis les données IA
+            loyer_hc = ai.get("loyer_hc")
+            loyer_cc = ai.get("loyer_cc")
+            charges_ai = ai.get("charges_mois")
+
+            if loyer_hc:
+                data["loyer"] = loyer_hc
+            elif loyer_cc and charges_ai:
+                data["loyer"] = loyer_cc - charges_ai  # CC - charges = HC
+            elif loyer_cc:
+                # CC sans détail charges → on l'utilise mais on le signale
+                data["loyer"] = loyer_cc
+
+            if ai.get("taxe_fonciere"):
+                data["taxe_fonciere"] = ai["taxe_fonciere"]
+            if charges_ai:
+                data["charges"] = charges_ai
+
+            # Champs supplémentaires IA
+            data["nb_lots"]       = ai.get("nb_lots", 1) or 1
+            data["loyer_detail"]  = ai.get("loyer_detail")   # liste ou None
+            data["loyer_source"]  = ai.get("loyer_source", "inconnu")
+            data["ai_notes"]      = ai.get("notes", "")
+
+            if data["loyer"]:
+                src = data["loyer_source"]
+                print(f"    [AI] loyer={data['loyer']}€/mois ({src})"
+                      + (f" | {data['nb_lots']} lots" if data["nb_lots"] > 1 else "")
+                      + (f" | {data['ai_notes'][:60]}" if data["ai_notes"] else ""))
+        else:
+            # ── Fallback regex si pas de clé API ──────────────────────
+            if data["loyer"] is None:
+                data["loyer"] = _regex_fallback_loyer(full_text)
+            if data["taxe_fonciere"] is None:
+                data["taxe_fonciere"] = _regex_fallback_taxe(full_text)
+            if data["charges"] is None:
+                data["charges"] = _regex_fallback_charges(full_text)
+            data["nb_lots"]      = 1
+            data["loyer_detail"] = None
+            data["loyer_source"] = "regex"
+            data["ai_notes"]     = ""
 
     except Exception as e:
         print(f"    [WARN] scrape_listing_detail({url}): {e}")
@@ -395,8 +495,8 @@ async def scrape_listing_detail(context, url: str) -> dict:
 # ── Filtre et enrichissement ──────────────────────────────────────
 
 def enrich(listing: dict):
-    price = listing.get("price")
-    loyer = listing.get("loyer")
+    price  = listing.get("price")
+    loyer  = listing.get("loyer")
 
     if price is None:
         return None
@@ -405,20 +505,41 @@ def enrich(listing: dict):
     if loyer is None:
         return None
 
-    fn = frais_notaire(price)
+    fn         = frais_notaire(price)
     total_cost = price + fn
     yield_brut = calc_yield_brut(loyer, price)
 
     if yield_brut is None or yield_brut < MIN_YIELD:
         return None
 
-    taxe = listing.get("taxe_fonciere")
+    taxe    = listing.get("taxe_fonciere")
     charges = listing.get("charges")
     yield_net = calc_yield_net(loyer, price, taxe, charges)
 
-    surface = listing.get("surface")
-    price_m2 = round(price / surface, 0) if surface else None
-    loyer_m2 = round(loyer / surface, 2) if surface else None
+    surface   = listing.get("surface")
+    price_m2  = round(price / surface, 0) if surface else None
+    loyer_m2  = round(loyer / surface, 2) if surface else None
+
+    nb_lots      = listing.get("nb_lots", 1) or 1
+    loyer_detail = listing.get("loyer_detail")  # liste ou None
+    loyer_source = listing.get("loyer_source", BLANK)
+    ai_notes     = listing.get("ai_notes", "")
+
+    # Label loyer source pour l'affichage HTML
+    source_labels = {
+        "hc":              "HC extrait",
+        "cc_moins_charges":"CC − charges",
+        "cc":              "CC (charges incluses)",
+        "calcule":         "Calculé",
+        "regex":           "Regex (sans IA)",
+        "inconnu":         BLANK,
+    }
+    loyer_label = source_labels.get(loyer_source, loyer_source)
+
+    # Détail multi-lots en texte lisible
+    lots_str = BLANK
+    if loyer_detail and isinstance(loyer_detail, list) and len(loyer_detail) > 1:
+        lots_str = " + ".join(f"{v}€" for v in loyer_detail) + f" = {loyer}€"
 
     return {
         "url":             listing.get("url", BLANK),
@@ -430,12 +551,16 @@ def enrich(listing: dict):
         "frais_notaire":   fn,
         "cout_total":      total_cost,
         "prix_m2":         price_m2 or BLANK,
+        "nb_lots":         nb_lots if nb_lots > 1 else BLANK,
         "loyer_hc":        loyer,
+        "loyer_detail":    lots_str,
+        "loyer_source":    loyer_label,
         "loyer_m2":        loyer_m2 or BLANK,
         "taxe_fonciere":   taxe or BLANK,
         "charges_mois":    charges or BLANK,
         "rendement_brut":  yield_brut,
         "rendement_net":   yield_net or BLANK,
+        "ai_notes":        ai_notes[:120] if ai_notes else BLANK,
         "description":     (listing.get("description") or BLANK)[:300],
         "nouveau":         False,
         "date_scraping":   datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -492,7 +617,7 @@ function filterTable(){
   const minY=parseFloat(document.getElementById('minYield').value)||0;
   const maxP=parseFloat(document.getElementById('maxPrice').value)||Infinity;
   for(const r of document.getElementById('tbl').tBodies[0].rows){
-    const y=parseFloat(r.cells[13].dataset.val)||0;
+    const y=parseFloat(r.cells[16].dataset.val)||0;
     const p=parseFloat(r.cells[5].dataset.val)||0;
     r.style.display=r.innerText.toLowerCase().includes(q)&&y>=minY&&p<=maxP?'':'none';
   }
@@ -520,8 +645,10 @@ def export_html(listings: list, path: Path) -> None:
     headers = [
         "#", "Titre", "Ville", "Pièces", "Surface",
         "Prix net", "Frais notaire", "Coût total", "Prix/m²",
-        "Loyer HC", "Loyer/m²", "Taxe foncière", "Charges/mois",
-        "Rdt brut", "Rdt net", "Description", "Date scraping",
+        "Lots", "Loyer HC", "Détail loyers", "Source loyer", "Loyer/m²",
+        "Taxe foncière", "Charges/mois",
+        "Rdt brut", "Rdt net",
+        "Notes IA", "Description", "Date scraping",
     ]
     ths = "".join(f'<th onclick="sortTable({i})">{h} ⇅</th>' for i, h in enumerate(headers))
 
@@ -535,16 +662,28 @@ def export_html(listings: list, path: Path) -> None:
             return f'<td data-val="{dval}">{fmt(val, suf, dec)}</td>'
 
         yb, yn = l["rendement_brut"], l["rendement_net"]
+
+        # Badge source loyer
+        src = l.get("loyer_source", BLANK)
+        src_color = {"CC (charges incluses)": "#e07800", "Regex (sans IA)": "#888"}.get(src, "#2d6a4f")
+        src_badge = f'<span style="font-size:10px;color:{src_color};font-weight:bold">{src}</span>' if src != BLANK else fmt(BLANK)
+
         rows.append(f"""<tr{tr_cls}>
 <td>{i}</td>
 <td><a href="{l['url']}" target="_blank">{str(l['titre'])[:50]}{badge}</a></td>
 <td>{l['ville']}</td>
 {c(l['nb_pieces'])}{c(l['surface_m2'],' m²')}
 {c(l['prix_net'],' €',dv=l['prix_net'])}{c(l['frais_notaire'],' €')}{c(l['cout_total'],' €')}
-{c(l['prix_m2'],' €/m²')}{c(l['loyer_hc'],' €/mois')}{c(l['loyer_m2'],' €/m²')}
+{c(l['prix_m2'],' €/m²')}
+{c(l['nb_lots'])}
+{c(l['loyer_hc'],' €/mois')}
+<td class="desc">{l.get('loyer_detail', BLANK) if l.get('loyer_detail',BLANK)!=BLANK else fmt(BLANK)}</td>
+<td>{src_badge}</td>
+{c(l['loyer_m2'],' €/m²')}
 {c(l['taxe_fonciere'],' €/an')}{c(l['charges_mois'],' €/mois')}
 <td data-val="{yb if yb!=BLANK else ''}"><span class="{yclass(yb)}">{fmt(yb,'%',2)}</span></td>
 <td data-val="{yn if yn!=BLANK else ''}"><span class="{yclass(yn)}">{fmt(yn,'%',2)}</span></td>
+<td class="desc" style="font-size:11px;color:#666">{l.get('ai_notes',BLANK) if l.get('ai_notes',BLANK)!=BLANK else fmt(BLANK)}</td>
 <td class="desc">{str(l['description'])[:200]}</td>
 <td>{l.get('date_scraping',BLANK)}</td>
 </tr>""")
