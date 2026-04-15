@@ -218,111 +218,99 @@ def calc_yield_net(loyer_mensuel, prix_net, taxe_fonciere, charges_mensuelles):
     return round(revenus_nets / total * 100, 2)
 
 
+# ── Extraction des liens d'annonces via JavaScript ────────────────
+
+async def get_ad_links_from_page(page) -> list:
+    """
+    Extrait tous les liens d'annonces depuis le DOM de la page courante.
+    N'effectue AUCUNE navigation — travaille sur la page déjà chargée.
+    """
+    links = await page.evaluate("""() => {
+        const seen = new Set();
+        const out = [];
+        for (const a of document.querySelectorAll('a[href]')) {
+            const h = a.href;
+            if (
+                (h.includes('/ventes_immobilieres/') ||
+                 h.includes('/locations/') ||
+                 /\\/ad\\/[^/]+\\/\\d+/.test(h)) &&
+                !seen.has(h)
+            ) {
+                seen.add(h);
+                out.push(h);
+            }
+        }
+        return out;
+    }""")
+    return links
+
+
 # ── Scraping d'une page de résultats ─────────────────────────────
 
-async def scrape_results_page(page, url: str) -> list:
-    listings = []
-    current_url = url
+async def scrape_results_page(page) -> list:
+    """
+    Extrait les liens d'annonces de la page courante (déjà chargée dans Chrome).
+    Gère la pagination via clic sur "page suivante" (pas de page.goto).
+    """
+    await page.wait_for_load_state("networkidle")
+    await page.wait_for_timeout(500)
 
-    while current_url:
-        print(f"  → Scraping : {current_url}")
-        await page.goto(current_url, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
+    all_links = []
+    page_num = 1
 
-        cards = await page.query_selector_all(
-            "[data-qa-id='aditem_container'], article[data-test-id='ad'], "
-            "li[data-test-id='listing-ad-item'], [data-test-id='ad-card']"
-        )
-        if not cards:
-            cards = await page.query_selector_all("a[href*='/ad/']")
-
-        for card in cards:
-            listing = await extract_listing_from_card(card)
-            if listing:
-                listings.append(listing)
+    while True:
+        links = await get_ad_links_from_page(page)
+        new = [l for l in links if l not in all_links]
+        all_links.extend(new)
+        print(f"  → Page {page_num} : {len(new)} lien(s) trouvé(s) (total {len(all_links)})")
 
         next_btn = await page.query_selector(
             "[data-qa-id='pagination_next_page'], "
             "a[aria-label='Page suivante'], "
             "a[rel='next'], "
-            "[data-test-id='pagination-next']"
+            "[data-test-id='pagination-next'], "
+            "button[aria-label*='suivant'], button[aria-label*='next']"
         )
-        if next_btn:
-            next_href = await next_btn.get_attribute("href")
-            if next_href:
-                current_url = (
-                    next_href if next_href.startswith("http")
-                    else "https://www.leboncoin.fr" + next_href
-                )
-            else:
-                await next_btn.click()
-                await page.wait_for_load_state("domcontentloaded")
-                await page.wait_for_timeout(1500)
-                new_url = page.url
-                if new_url == current_url:
-                    break
-                current_url = new_url
-        else:
+        if not next_btn:
             break
 
-    return listings
+        prev_url = page.url
+        try:
+            await next_btn.click()
+            await page.wait_for_load_state("networkidle")
+            await page.wait_for_timeout(1500)
+        except Exception as e:
+            print(f"  [WARN] Pagination page {page_num}: {e}")
+            break
 
+        if page.url == prev_url:
+            break
+        page_num += 1
 
-async def extract_listing_from_card(card) -> dict:
-    try:
-        url = None
-        if await card.get_attribute("href"):
-            url = await card.get_attribute("href")
-        else:
-            link = await card.query_selector("a[href*='/ad/']")
-            if link:
-                url = await link.get_attribute("href")
-        if not url:
-            return None
-        if not url.startswith("http"):
-            url = "https://www.leboncoin.fr" + url
-
-        title_el = await card.query_selector(
-            "[data-qa-id='aditem_title'], [data-test-id='ad-title'], h2, h3"
-        )
-        title = _text(await title_el.inner_text()) if title_el else BLANK
-
-        price_el = await card.query_selector(
-            "[data-qa-id='aditem_price'], [data-test-id='ad-price'], "
-            "[class*='price'], [class*='Price']"
-        )
-        price_text = _text(await price_el.inner_text()) if price_el else ""
-        price = parse_price(price_text)
-
-        loc_el = await card.query_selector(
-            "[data-qa-id='aditem_location'], [data-test-id='ad-location'], "
-            "[class*='location'], [class*='Location']"
-        )
-        location = _text(await loc_el.inner_text()) if loc_el else BLANK
-
-        surface_text = title + " " + (_text(await card.inner_text()))
-        surface = parse_surface(surface_text)
-
-        return {
-            "url": url,
-            "title": title,
-            "price": price,
-            "location": location,
-            "surface": surface,
+    return [
+        {
+            "url": link,
+            "title": BLANK,
+            "price": None,
+            "location": BLANK,
+            "surface": None,
             "loyer": None,
             "taxe_fonciere": None,
             "charges": None,
             "nb_pieces": None,
             "description": None,
         }
-    except Exception as e:
-        print(f"    [WARN] extract_listing_from_card: {e}")
-        return None
+        for link in all_links
+    ]
 
 
 # ── Scraping du détail d'une annonce ─────────────────────────────
 
-async def scrape_listing_detail(page, url: str) -> dict:
+async def scrape_listing_detail(context, url: str) -> dict:
+    """
+    Ouvre l'annonce dans un NOUVEL onglet, scrape, ferme l'onglet.
+    La page de résultats reste intacte dans Chrome.
+    """
     data = {
         "url": url,
         "title": BLANK,
@@ -335,9 +323,10 @@ async def scrape_listing_detail(page, url: str) -> dict:
         "nb_pieces": None,
         "description": BLANK,
     }
+    page = await context.new_page()
     try:
         await page.goto(url, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(1500)
 
         for sel in ["h1", "[data-qa-id='ad_title']", "[data-test-id='ad-title']"]:
             el = await page.query_selector(sel)
@@ -397,6 +386,8 @@ async def scrape_listing_detail(page, url: str) -> dict:
 
     except Exception as e:
         print(f"    [WARN] scrape_listing_detail({url}): {e}")
+    finally:
+        await page.close()
 
     return data
 
@@ -685,13 +676,24 @@ async def main():
 
         print()
 
-        # Scraping
+        # Scraping — pas de navigation sur la page courante
         all_raw = []
-        for url in result_urls:
-            print(f"Scraping : {url[:80]}")
-            cards = await scrape_results_page(page, url)
-            print(f"  {len(cards)} annonce(s) trouvee(s)")
+        if page_type == "results" and result_urls and page.url == result_urls[0]:
+            # Page déjà chargée par l'utilisateur : extraction directe sans goto()
+            print(f"Extraction sans navigation (page déjà chargée)...")
+            cards = await scrape_results_page(page)
             all_raw.extend(cards)
+        else:
+            # Recherches sauvegardées ou changement de page nécessaire
+            for target_url in result_urls:
+                print(f"Navigation vers : {target_url[:80]}")
+                if page.url != target_url:
+                    await page.goto(target_url, wait_until="networkidle")
+                    await page.wait_for_timeout(2000)
+                cards = await scrape_results_page(page)
+                all_raw.extend(cards)
+
+        print(f"  {len(all_raw)} lien(s) d'annonces trouvé(s) au total")
 
         print(f"\nTotal brut : {len(all_raw)}")
         print("Visite des details et filtrage...\n")
@@ -710,7 +712,7 @@ async def main():
         for i, card in enumerate(unique_raw, 1):
             url = card.get("url", "")
             print(f"  [{i}/{len(unique_raw)}] {url[:70]}")
-            detail = await scrape_listing_detail(page, url)
+            detail = await scrape_listing_detail(context, url)
             merged = {**card, **{k: v for k, v in detail.items() if v is not None and v != BLANK}}
             result = enrich(merged)
             if result is None:
