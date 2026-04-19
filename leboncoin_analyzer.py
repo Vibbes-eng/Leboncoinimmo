@@ -497,39 +497,167 @@ async def get_ad_links_from_page(page) -> list:
     }""")
 
 # ── Scraping page de résultats ─────────────────────────────────────
+def _build_page_url(base_url: str, page_num: int) -> str:
+    """Injecte ou remplace le paramètre ?page=N dans l'URL LeBonCoin."""
+    if "page=" in base_url:
+        return re.sub(r"page=\d+", f"page={page_num}", base_url)
+    sep = "&" if "?" in base_url else "?"
+    return f"{base_url}{sep}page={page_num}"
+
+
+async def _detect_total_pages(page) -> int:
+    """Détecte le nombre total de pages depuis la pagination ou les compteurs."""
+    try:
+        # Méthode 1 : liens de pagination avec numéros
+        total = await page.evaluate("""() => {
+            let max = 1;
+            // Chercher tous les liens/boutons avec un numéro de page
+            const sels = [
+                'a[href*="page="]',
+                '[data-qa-id*="pagination"] a',
+                'nav[aria-label*="agination"] a',
+                '[class*="pagination"] a',
+                '[class*="Pagination"] a',
+            ];
+            for (const sel of sels) {
+                for (const el of document.querySelectorAll(sel)) {
+                    const m = (el.href || el.textContent || '').match(/page=?\\s*(\\d+)/);
+                    if (m) max = Math.max(max, parseInt(m[1]));
+                    const t = el.textContent.trim();
+                    if (/^\\d+$/.test(t)) max = Math.max(max, parseInt(t));
+                }
+            }
+            return max;
+        }""")
+        if total > 1:
+            return total
+
+        # Méthode 2 : déduire depuis le compteur d'annonces (ex: "703 annonces")
+        count_text = await page.evaluate("""() => {
+            for (const sel of ['[data-qa-id="result-count"]','[data-test-id="results-count"]',
+                               'h1','[class*="ResultsCount"]','[class*="result-count"]']) {
+                const el = document.querySelector(sel);
+                if (el) return el.textContent;
+            }
+            return '';
+        }""")
+        m = re.search(r"(\d[\d\s]*)", count_text.replace("\xa0", ""))
+        if m:
+            count = int(re.sub(r"\s", "", m.group(1)))
+            # LeBonCoin affiche ~35 annonces par page
+            pages = math.ceil(count / 35)
+            if pages > 1:
+                print(f"  → {count} annonces détectées → ~{pages} pages estimées")
+                return pages
+    except Exception:
+        pass
+    return 1
+
+
 async def scrape_results_page(page) -> list:
+    """
+    Collecte tous les liens d'annonces en paginant via URL (?page=N).
+    Fallback sur clic bouton si l'URL ne change pas.
+    """
     await page.wait_for_load_state("networkidle")
     await page.wait_for_timeout(human_delay(800, 1500))
     await human_scroll(page, "down")
     await page.wait_for_timeout(human_delay(400, 800))
     await human_scroll(page, "down")
 
-    all_links, page_num = [], 1
+    base_url   = page.url
+    all_links  = []
+    page_num   = 1
+    empty_streak = 0  # pages consécutives sans nouveaux liens → arrêt
+
+    # Détection du nombre total de pages
+    total_pages = await _detect_total_pages(page)
+    if total_pages > 1:
+        print(f"  → Pagination détectée : {total_pages} page(s)")
+
     while True:
         await human_mouse_move(page)
+
         links = await get_ad_links_from_page(page)
-        new = [l for l in links if l not in all_links]
+        new   = [l for l in links if l not in all_links]
         all_links.extend(new)
-        print(f"  → Page {page_num} : {len(new)} lien(s) trouvé(s) (total {len(all_links)})")
+        print(f"  → Page {page_num}/{total_pages} : {len(new)} lien(s) (total {len(all_links)})")
 
-        next_btn = await page.query_selector(
-            "[data-qa-id='pagination_next_page'], a[aria-label='Page suivante'], "
-            "a[rel='next'], [data-test-id='pagination-next'], button[aria-label*='suivant']"
-        )
-        if not next_btn: break
-        prev_url = page.url
+        if len(new) == 0:
+            empty_streak += 1
+            if empty_streak >= 2:
+                print("  → 2 pages vides consécutives — arrêt pagination")
+                break
+        else:
+            empty_streak = 0
+
+        # Condition d'arrêt : on a atteint la dernière page connue
+        if page_num >= total_pages and total_pages > 1:
+            break
+
+        # ── Stratégie 1 : navigation par URL ─────────────────────
+        next_url = _build_page_url(base_url, page_num + 1)
         try:
-            await next_btn.scroll_into_view_if_needed()
-            await page.wait_for_timeout(human_delay(400, 900))
-            await next_btn.click()
-            await page.wait_for_load_state("networkidle")
+            await page.goto(next_url, wait_until="networkidle", timeout=30000)
             await page.wait_for_timeout(human_delay(1500, 3000))
-        except Exception as e:
-            print(f"  [WARN] Pagination: {e}"); break
-        if page.url == prev_url: break
-        await detect_and_handle_block(page)
-        page_num += 1
 
+            # Si LeBonCoin redirige vers une page sans résultats, arrêter
+            current = page.url
+            if "page=" in current:
+                m = re.search(r"page=(\d+)", current)
+                if m and int(m.group(1)) != page_num + 1:
+                    print("  → Redirection détectée — fin de pagination")
+                    break
+
+            blocked = await detect_and_handle_block(page)
+            if blocked:
+                # Si on était bloqué, re-essayer la même page
+                await page.goto(next_url, wait_until="networkidle", timeout=30000)
+                await page.wait_for_timeout(human_delay(2000, 4000))
+
+            # Si pas de total connu, détecter dynamiquement sur chaque page
+            if total_pages == 1:
+                total_pages = await _detect_total_pages(page)
+
+            page_num += 1
+
+        except Exception as e:
+            print(f"  [WARN] Navigation page {page_num+1} : {e}")
+            # ── Fallback : clic sur bouton suivant ────────────────
+            try:
+                next_btn = await page.query_selector(
+                    "[data-qa-id='pagination_next_page'], "
+                    "a[aria-label='Page suivante'], a[aria-label='Next'], "
+                    "a[rel='next'], [data-test-id='pagination-next'], "
+                    "button[aria-label*='suivant'], button[aria-label*='next'], "
+                    "a[data-spark-component*='pagination'][aria-label*='uivant'], "
+                    "[class*='pagination'] [aria-label*='uivant'], "
+                    "[class*='Pagination'] [aria-label*='uivant']"
+                )
+                if not next_btn:
+                    print("  → Bouton suivant introuvable — fin pagination")
+                    break
+                prev_url = page.url
+                await next_btn.scroll_into_view_if_needed()
+                await page.wait_for_timeout(human_delay(400, 900))
+                await next_btn.click()
+                await page.wait_for_load_state("networkidle")
+                await page.wait_for_timeout(human_delay(1500, 3000))
+                if page.url == prev_url:
+                    print("  → URL inchangée après clic — fin pagination")
+                    break
+                page_num += 1
+            except Exception as e2:
+                print(f"  [WARN] Fallback clic : {e2}")
+                break
+
+        # Pause humaine toutes les 5 pages
+        if page_num % 5 == 0:
+            pause = random.randint(3000, 6000)
+            print(f"  [pause {pause//1000}s — pagination]")
+            await page.wait_for_timeout(pause)
+
+    print(f"  → Pagination terminée : {len(all_links)} annonce(s) au total")
     return [{"url": l, "title": BLANK, "price": None, "location": BLANK,
              "surface": None, "loyer": None, "taxe_fonciere": None,
              "charges": None, "nb_pieces": None, "description": None} for l in all_links]
