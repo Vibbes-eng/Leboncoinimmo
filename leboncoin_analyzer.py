@@ -559,63 +559,184 @@ async def _find_next_button(page):
     return None
 
 
+async def _get_total_pages(page) -> int:
+    """
+    Détecte le nombre total de pages depuis :
+    1. Les liens de pagination (numéros visibles)
+    2. Le compteur d'annonces (ex: "703 annonces" → ceil(703/35))
+    """
+    # Méthode 1 : lire le plus grand numéro dans les liens de pagination
+    try:
+        max_page = await page.evaluate("""() => {
+            let max = 1;
+            const sels = [
+                'a[href*="page="]',
+                '[data-qa-id*="pagination"] a',
+                '[data-test-id*="pagination"] a',
+                'nav[aria-label*="agination"] a',
+                '[class*="pagination"] a',
+                '[class*="Pagination"] a',
+            ];
+            for (const sel of sels) {
+                for (const el of document.querySelectorAll(sel)) {
+                    // Depuis l'href
+                    const hm = (el.href || '').match(/[?&]page=(\\d+)/);
+                    if (hm) max = Math.max(max, parseInt(hm[1]));
+                    // Depuis le texte du bouton (ex: "10", "15")
+                    const t = (el.textContent || '').trim();
+                    if (/^\\d+$/.test(t) && parseInt(t) < 500) max = Math.max(max, parseInt(t));
+                }
+            }
+            return max;
+        }""")
+        if max_page > 1:
+            return max_page
+    except Exception:
+        pass
+
+    # Méthode 2 : compteur d'annonces → estimation
+    try:
+        count_text = await page.evaluate("""() => {
+            const sels = [
+                '[data-qa-id="result-count"]', '[data-test-id="results-count"]',
+                '[class*="ResultsCount"]', '[class*="result-count"]',
+                '[class*="resultsCount"]', 'h1', 'h2',
+            ];
+            for (const sel of sels) {
+                const el = document.querySelector(sel);
+                if (el && /\\d/.test(el.textContent)) return el.textContent;
+            }
+            return '';
+        }""")
+        m = re.search(r"(\d[\d\u202f\s]*\d|\d)", count_text)
+        if m:
+            count = int(re.sub(r"[\s\u202f]", "", m.group(1)))
+            pages = math.ceil(count / 35)
+            if pages > 1:
+                print(f"  → {count} annonces détectées → {pages} pages estimées")
+                return pages
+    except Exception:
+        pass
+
+    return 1
+
+
+def _url_for_page(base_url: str, n: int) -> str:
+    """Construit l'URL pour la page n."""
+    if re.search(r"[?&]page=\d+", base_url):
+        return re.sub(r"(page=)\d+", f"\\g<1>{n}", base_url)
+    sep = "&" if "?" in base_url else "?"
+    return f"{base_url}{sep}page={n}"
+
+
 async def scrape_results_page(page) -> list:
     """
     Collecte tous les liens d'annonces page par page.
-    Stratégie : comportement humain (lecture + scroll + clic bouton).
-    Pas de navigation URL directe — trop détectable.
+    - Pages 1..N via clic bouton (anti-bot, comportement humain)
+    - Si le bouton disparaît avant la fin (LeBonCoin cap à 10 liens visibles),
+      on reprend en navigation URL avec de longues pauses humaines.
     """
     await page.wait_for_load_state("networkidle")
     await page.wait_for_timeout(human_delay(1500, 3000))
-
-    # Simuler la lecture de la première page
     await _simulate_human_reading(page)
 
-    all_links  = []
-    page_num   = 1
+    base_url     = page.url
+    all_links    = []
+    page_num     = 1
     empty_streak = 0
+
+    # Détecter le total dès la page 1
+    total_pages = await _get_total_pages(page)
+    if total_pages > 1:
+        print(f"  → {total_pages} page(s) détectée(s) au total")
 
     while True:
         links = await get_ad_links_from_page(page)
         new   = [l for l in links if l not in all_links]
         all_links.extend(new)
-        print(f"  → Page {page_num} : {len(new)} lien(s) (total {len(all_links)})")
+        print(f"  → Page {page_num}/{total_pages} : {len(new)} lien(s) (total {len(all_links)})")
 
         if len(new) == 0:
             empty_streak += 1
             if empty_streak >= 2:
-                print("  → 2 pages vides — arrêt")
+                print("  → 2 pages vides consécutives — arrêt")
                 break
         else:
             empty_streak = 0
 
-        # Chercher le bouton suivant
-        next_btn = await _find_next_button(page)
-        if not next_btn:
-            print("  → Dernière page atteinte")
+        # Condition d'arrêt : toutes les pages connues traitées
+        if page_num >= total_pages and total_pages > 1:
+            print("  → Toutes les pages parcourues")
             break
 
-        prev_url = page.url
+        next_btn = await _find_next_button(page)
 
-        # Scroll jusqu'au bouton (comportement naturel)
-        await next_btn.scroll_into_view_if_needed()
-        await page.wait_for_timeout(random.randint(800, 2000))  # "lire" avant de cliquer
+        if next_btn:
+            # ── Stratégie A : clic humain sur le bouton ──────────
+            prev_url = page.url
+            await next_btn.scroll_into_view_if_needed()
+            await page.wait_for_timeout(random.randint(800, 2000))
 
-        # Déplacer la souris vers le bouton puis cliquer
-        box = await next_btn.bounding_box()
-        if box:
-            cx = box["x"] + box["width"] / 2
-            cy = box["y"] + box["height"] / 2
-            await human_mouse_move(page, int(cx), int(cy))
-            await page.wait_for_timeout(random.randint(200, 600))
+            box = await next_btn.bounding_box()
+            if box:
+                cx = int(box["x"] + box["width"] / 2)
+                cy = int(box["y"] + box["height"] / 2)
+                await human_mouse_move(page, cx, cy)
+                await page.wait_for_timeout(random.randint(200, 500))
+                try:
+                    await next_btn.click()
+                except Exception:
+                    await page.mouse.click(cx, cy)
+            else:
+                await next_btn.click()
 
-        try:
-            await next_btn.click()
-        except Exception:
-            await page.mouse.click(int(cx), int(cy))
+            await page.wait_for_load_state("networkidle")
+            await page.wait_for_timeout(human_delay(3000, 7000))
 
-        # Attendre le chargement — délai long et variable (humain)
-        await page.wait_for_load_state("networkidle")
+            if page.url == prev_url:
+                # URL inchangée = LeBonCoin utilise AJAX → forcer URL
+                print(f"  [INFO] URL inchangée — passage en navigation URL pour la suite")
+                next_btn = None  # force le fallback URL ci-dessous
+
+            else:
+                blocked = await detect_and_handle_block(page)
+                if blocked:
+                    await page.wait_for_load_state("networkidle")
+                    await page.wait_for_timeout(human_delay(3000, 6000))
+
+        if not next_btn:
+            # ── Stratégie B : navigation URL (bouton absent/AJAX) ─
+            # LeBonCoin limite l'affichage à 10 numéros de page max.
+            # On continue en URL avec de longues pauses pour rester discret.
+            next_url = _url_for_page(base_url, page_num + 1)
+            print(f"  [INFO] Bouton absent — navigation URL : page {page_num + 1}")
+            try:
+                await page.goto(next_url, wait_until="networkidle", timeout=30000)
+                await page.wait_for_timeout(human_delay(4000, 9000))
+                blocked = await detect_and_handle_block(page)
+                if blocked:
+                    await page.goto(next_url, wait_until="networkidle", timeout=30000)
+                    await page.wait_for_timeout(human_delay(4000, 8000))
+                # Mettre à jour le total si on ne l'avait pas encore
+                if total_pages <= 1:
+                    total_pages = await _get_total_pages(page)
+            except Exception as e:
+                print(f"  [WARN] Navigation URL échouée : {e} — arrêt")
+                break
+
+        page_num += 1
+        await _simulate_human_reading(page)
+
+        # Pause inter-pages : longue et aléatoire
+        inter = random.randint(8000, 20000)
+        print(f"  [pause {inter//1000}s]")
+        await page.wait_for_timeout(inter)
+
+        # Pause très longue toutes les 4 pages
+        if page_num % 4 == 0:
+            long_p = random.randint(25000, 45000)
+            print(f"  [pause longue {long_p//1000}s — page {page_num}]")
+            await page.wait_for_timeout(long_p)
         await page.wait_for_timeout(human_delay(3000, 7000))
 
         if page.url == prev_url:
