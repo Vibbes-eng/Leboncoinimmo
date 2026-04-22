@@ -631,140 +631,75 @@ def _url_for_page(base_url: str, n: int) -> str:
 
 async def scrape_results_page(page) -> list:
     """
-    Collecte tous les liens d'annonces page par page.
-    - Pages 1..N via clic bouton (anti-bot, comportement humain)
-    - Si le bouton disparaît avant la fin (LeBonCoin cap à 10 liens visibles),
-      on reprend en navigation URL avec de longues pauses humaines.
+    MODE MANUEL — 100% indétectable par DataDome.
+
+    Le script lit les liens de la page courante, puis attend que TU
+    navigues vers la page suivante dans Chrome. Aucune action automatique
+    sur le navigateur pendant la pagination.
+
+    Commandes dans le terminal :
+      [Entrée]      → page suivante collectée
+      stop / s      → arrêter la collecte et passer au scraping des annonces
     """
     await page.wait_for_load_state("networkidle")
-    await page.wait_for_timeout(human_delay(1500, 3000))
-    await _simulate_human_reading(page)
 
-    base_url     = page.url
-    all_links    = []
-    page_num     = 1
-    empty_streak = 0
-
-    # Détecter le total dès la page 1
+    # Détecter le total de pages pour affichage
     total_pages = await _get_total_pages(page)
+
+    all_links = []
+    page_num  = 1
+
+    print()
+    print("  ╔══════════════════════════════════════════════════════╗")
+    print("  ║  MODE NAVIGATION MANUELLE — anti-détection DataDome  ║")
+    print("  ╚══════════════════════════════════════════════════════╝")
     if total_pages > 1:
-        print(f"  → {total_pages} page(s) détectée(s) au total")
+        print(f"  → {total_pages} page(s) détectée(s)")
+    print()
 
     while True:
+        await page.wait_for_load_state("networkidle")
+
         links = await get_ad_links_from_page(page)
         new   = [l for l in links if l not in all_links]
         all_links.extend(new)
-        print(f"  → Page {page_num}/{total_pages} : {len(new)} lien(s) (total {len(all_links)})")
 
-        if len(new) == 0:
-            empty_streak += 1
-            if empty_streak >= 2:
-                print("  → 2 pages vides consécutives — arrêt")
-                break
-        else:
-            empty_streak = 0
+        pbar = f"{page_num}/{total_pages}" if total_pages > 1 else str(page_num)
+        print(f"  ✓ Page {pbar} : {len(new)} annonce(s) collectée(s)  [total : {len(all_links)}]")
 
-        # Condition d'arrêt : toutes les pages connues traitées
-        if page_num >= total_pages and total_pages > 1:
-            print("  → Toutes les pages parcourues")
+        print()
+        print(f"  ┌─ ACTION REQUISE ──────────────────────────────────────")
+        print(f"  │  Dans Chrome → clique sur « Page suivante »")
+        print(f"  │  Puis reviens ici et appuie sur ENTRÉE")
+        print(f"  │  (tape  stop  puis ENTRÉE pour terminer la collecte)")
+        print(f"  └───────────────────────────────────────────────────────")
+        print(f"  > ", end="", flush=True)
+
+        user_input = await asyncio.get_event_loop().run_in_executor(None, input)
+        user_input = user_input.strip().lower()
+
+        if user_input in ("stop", "s", "q", "fin", "done"):
+            print(f"  → Collecte terminée manuellement")
             break
 
-        next_btn = await _find_next_button(page)
+        # Attendre que Chrome ait chargé la nouvelle page
+        await page.wait_for_load_state("networkidle")
+        await page.wait_for_timeout(1000)
 
-        if next_btn:
-            # ── Stratégie A : clic humain sur le bouton ──────────
-            prev_url = page.url
-            await next_btn.scroll_into_view_if_needed()
-            await page.wait_for_timeout(random.randint(800, 2000))
-
-            box = await next_btn.bounding_box()
-            if box:
-                cx = int(box["x"] + box["width"] / 2)
-                cy = int(box["y"] + box["height"] / 2)
-                await human_mouse_move(page, cx, cy)
-                await page.wait_for_timeout(random.randint(200, 500))
-                try:
-                    await next_btn.click()
-                except Exception:
-                    await page.mouse.click(cx, cy)
-            else:
-                await next_btn.click()
-
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(human_delay(3000, 7000))
-
-            if page.url == prev_url:
-                # URL inchangée = LeBonCoin utilise AJAX → forcer URL
-                print(f"  [INFO] URL inchangée — passage en navigation URL pour la suite")
-                next_btn = None  # force le fallback URL ci-dessous
-
-            else:
-                blocked = await detect_and_handle_block(page)
-                if blocked:
-                    await page.wait_for_load_state("networkidle")
-                    await page.wait_for_timeout(human_delay(3000, 6000))
-
-        if not next_btn:
-            # ── Stratégie B : navigation URL (bouton absent/AJAX) ─
-            # LeBonCoin limite l'affichage à 10 numéros de page max.
-            # On continue en URL avec de longues pauses pour rester discret.
-            next_url = _url_for_page(base_url, page_num + 1)
-            print(f"  [INFO] Bouton absent — navigation URL : page {page_num + 1}")
-            try:
-                await page.goto(next_url, wait_until="networkidle", timeout=30000)
-                await page.wait_for_timeout(human_delay(4000, 9000))
-                blocked = await detect_and_handle_block(page)
-                if blocked:
-                    await page.goto(next_url, wait_until="networkidle", timeout=30000)
-                    await page.wait_for_timeout(human_delay(4000, 8000))
-                # Mettre à jour le total si on ne l'avait pas encore
-                if total_pages <= 1:
-                    total_pages = await _get_total_pages(page)
-            except Exception as e:
-                print(f"  [WARN] Navigation URL échouée : {e} — arrêt")
-                break
-
-        page_num += 1
-        await _simulate_human_reading(page)
-
-        # Pause inter-pages : longue et aléatoire
-        inter = random.randint(8000, 20000)
-        print(f"  [pause {inter//1000}s]")
-        await page.wait_for_timeout(inter)
-
-        # Pause très longue toutes les 4 pages
-        if page_num % 4 == 0:
-            long_p = random.randint(25000, 45000)
-            print(f"  [pause longue {long_p//1000}s — page {page_num}]")
-            await page.wait_for_timeout(long_p)
-        await page.wait_for_timeout(human_delay(3000, 7000))
-
-        if page.url == prev_url:
-            print("  → URL inchangée après clic — fin pagination")
-            break
-
-        blocked = await detect_and_handle_block(page)
-        if blocked:
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(human_delay(3000, 6000))
+        # Vérifier un éventuel blocage sur la nouvelle page
+        await detect_and_handle_block(page)
 
         page_num += 1
 
-        # Simuler la lecture de chaque nouvelle page
-        await _simulate_human_reading(page)
+        # Arrêt automatique si on a atteint le total connu
+        if total_pages > 1 and page_num > total_pages:
+            print(f"  → Toutes les {total_pages} pages collectées")
+            break
 
-        # Pause longue et aléatoire entre les pages (8–20s)
-        inter_page = random.randint(8000, 20000)
-        print(f"  [pause {inter_page//1000}s entre pages]")
-        await page.wait_for_timeout(inter_page)
+    print()
+    print(f"  ══ Collecte terminée : {len(all_links)} annonce(s) au total ══")
+    print()
 
-        # Pause très longue toutes les 4 pages (simuler une pause café)
-        if page_num % 4 == 0:
-            long_pause = random.randint(25000, 45000)
-            print(f"  [pause longue {long_pause//1000}s — page {page_num}]")
-            await page.wait_for_timeout(long_pause)
-
-    print(f"  → Total : {len(all_links)} annonce(s) collectée(s)")
     return [{"url": l, "title": BLANK, "price": None, "location": BLANK,
              "surface": None, "loyer": None, "taxe_fonciere": None,
              "charges": None, "nb_pieces": None, "description": None} for l in all_links]
