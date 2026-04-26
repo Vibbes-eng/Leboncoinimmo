@@ -11,6 +11,7 @@ Améliorations v3 :
 - Prompt IA anti-hallucination réécrit par prompt engineer
 - Tri colonnes HTML avec indicateurs ▲/▼, valeurs vides repoussées en bas
 - Loyer minimum requis affiché pour chaque bien sans loyer
+- Pagination automatique via interception API (indétectable par DataDome)
 """
 
 import asyncio
@@ -380,7 +381,7 @@ RETOURNE UNIQUEMENT CE JSON (aucun texte avant ou après) :
 async def ai_extract_financials(description: str, price=None, surface=None, location=None) -> dict:
     if not AI_PROVIDER or not description or description == BLANK:
         return {}
-    price_hint    = f"{price:,}€".replace(",", "\u202f") if price else "non précisé"
+    price_hint    = f"{price:,}€".replace(",", " ") if price else "non précisé"
     surface_hint  = f"{surface} m²" if surface else "non précisée"
     location_hint = location or "non précisée"
     prompt = _AI_PROMPT.format(
@@ -498,103 +499,127 @@ async def get_ad_links_from_page(page) -> list:
 
 # ── Scraping page de résultats ─────────────────────────────────────
 async def _simulate_human_reading(page) -> None:
-    """Simule la lecture humaine d'une page : scrolls progressifs + pauses."""
-    # Scroll lent vers le bas (lecture des annonces)
-    for _ in range(random.randint(3, 6)):
+    for _ in range(random.randint(2, 4)):
         await human_scroll(page, "down")
-        await page.wait_for_timeout(random.randint(600, 1800))
-    # Légère remontée (comportement naturel)
+        await page.wait_for_timeout(random.randint(500, 1200))
     await human_scroll(page, "up")
-    await page.wait_for_timeout(random.randint(400, 900))
-    # Quelques mouvements de souris naturels
-    await human_mouse_move(page)
     await page.wait_for_timeout(random.randint(300, 700))
     await human_mouse_move(page)
 
 
-async def _find_next_button(page):
-    """Cherche le bouton page suivante avec de nombreux sélecteurs."""
-    selectors = [
-        # Sélecteurs LeBonCoin connus
-        "[data-qa-id='pagination_next_page']",
-        "a[data-qa-id='pagination_next']",
-        "[data-test-id='pagination-next']",
-        # Aria labels français et anglais
-        "a[aria-label='Page suivante']",
-        "a[aria-label='Suivant']",
-        "button[aria-label='Page suivante']",
-        "button[aria-label='Suivant']",
-        "a[aria-label='Next']",
-        "button[aria-label='Next']",
-        # rel=next
-        "a[rel='next']",
-        # Spark design system (LeBonCoin utilise Spark)
-        "a[data-spark-component*='pagination'][aria-label*='uivant']",
-        "button[data-spark-component*='pagination'][aria-label*='uivant']",
-        # Classes génériques
-        "[class*='pagination'] a[aria-label*='uivant']",
-        "[class*='Pagination'] a[aria-label*='uivant']",
-        "nav[aria-label*='agination'] a[aria-label*='uivant']",
-    ]
-    for sel in selectors:
+def _url_for_page(base_url: str, n: int) -> str:
+    """Construit l'URL pour la page n."""
+    if re.search(r"[?&]page=\d+", base_url):
+        return re.sub(r"(page=)\d+", f"\\g<1>{n}", base_url)
+    sep = "&" if "?" in base_url else "?"
+    return f"{base_url}{sep}page={n}"
+
+
+def _extract_links_from_api(data: dict) -> list:
+    """Extrait les URLs d'annonces depuis la réponse JSON de l'API LeBonCoin."""
+    links = []
+    ads = data.get("ads", data.get("classifieds", data.get("data", [])))
+    if not isinstance(ads, list):
+        return links
+    for ad in ads:
+        url = ad.get("url") or ad.get("link") or ad.get("canonical_url", "")
+        list_id = ad.get("list_id") or ad.get("id")
+        if url and url.startswith("http") and "/ad/" in url:
+            links.append(url.split("?")[0])
+        elif list_id:
+            cat = ad.get("category_name", "ventes_immobilieres")
+            cat = str(cat).lower().replace(" ", "_")
+            links.append(f"https://www.leboncoin.fr/ad/{cat}/{list_id}.htm")
+    return links
+
+
+async def _capture_api_call(page) -> dict:
+    """
+    Intercepte l'appel API interne de LeBonCoin lors du rechargement de page.
+    Retourne les métadonnées de la requête pour pouvoir la rejouer côté navigateur.
+    """
+    captured = {}
+
+    async def on_response(response):
+        url = response.url
+        if not any(k in url for k in ["api.leboncoin", "/finder/", "/search", "/classified", "recherche"]):
+            return
+        if response.status != 200:
+            return
         try:
-            btn = await page.query_selector(sel)
-            if btn:
-                # Vérifier que le bouton est visible et non désactivé
-                visible = await btn.is_visible()
-                enabled = await btn.is_enabled()
-                if visible and enabled:
-                    return btn
+            data = await response.json()
+            if not isinstance(data, dict):
+                return
+            if not any(k in data for k in ("ads", "classifieds", "data")):
+                return
+            ads = data.get("ads", data.get("classifieds", data.get("data", [])))
+            if not isinstance(ads, list) or len(ads) == 0:
+                return
+            req = response.request
+            captured["url"]        = url
+            captured["method"]     = req.method
+            captured["headers"]    = dict(req.headers)
+            captured["body"]       = req.post_data or ""
+            captured["total"]      = int(data.get("total", data.get("total_count", data.get("total_results", 0))))
+            captured["per_page"]   = len(ads)
+            captured["page1_data"] = data
+            print(f"  [API] Intercepté : {url[:80]}")
+            print(f"  [API] {len(ads)} annonces/page | total : {captured['total']}")
         except Exception:
-            continue
+            pass
 
-    # Dernier recours : chercher via JavaScript un lien contenant "page=N+1"
-    current_page_m = re.search(r"page=(\d+)", page.url)
-    if current_page_m:
-        next_p = int(current_page_m.group(1)) + 1
-        btn = await page.query_selector(f"a[href*='page={next_p}']")
-        if btn:
-            return btn
-
-    return None
-
-
-async def _get_total_pages(page) -> int:
-    """
-    Détecte le nombre total de pages depuis :
-    1. Les liens de pagination (numéros visibles)
-    2. Le compteur d'annonces (ex: "703 annonces" → ceil(703/35))
-    """
-    # Méthode 1 : lire le plus grand numéro dans les liens de pagination
+    page.on("response", on_response)
     try:
-        max_page = await page.evaluate("""() => {
-            let max = 1;
-            const sels = [
-                'a[href*="page="]',
-                '[data-qa-id*="pagination"] a',
-                '[data-test-id*="pagination"] a',
-                'nav[aria-label*="agination"] a',
-                '[class*="pagination"] a',
-                '[class*="Pagination"] a',
-            ];
-            for (const sel of sels) {
-                for (const el of document.querySelectorAll(sel)) {
-                    // Depuis l'href
-                    const hm = (el.href || '').match(/[?&]page=(\\d+)/);
-                    if (hm) max = Math.max(max, parseInt(hm[1]));
-                    // Depuis le texte du bouton (ex: "10", "15")
-                    const t = (el.textContent || '').trim();
-                    if (/^\\d+$/.test(t) && parseInt(t) < 500) max = Math.max(max, parseInt(t));
-                }
-            }
-            return max;
-        }""")
-        if max_page > 1:
-            return max_page
+        await page.reload(wait_until="networkidle", timeout=25000)
     except Exception:
         pass
+    await page.wait_for_timeout(2000)
+    page.remove_listener("response", on_response)
+    return captured
 
-    # Méthode 2 : compteur d'annonces → estimation
+
+async def _fetch_page_via_browser(page, api: dict, page_num: int) -> dict:
+    """
+    Rejoue l'appel API depuis le contexte JS du navigateur (fetch natif de Chrome).
+    Indétectable par DataDome car la requête part du vrai Chrome avec ses cookies/TLS.
+    """
+    body = api.get("body", "")
+    url  = api["url"]
+
+    if body:
+        try:
+            b = json.loads(body)
+            offset = (page_num - 1) * api["per_page"]
+            if "offset" in b:
+                b["offset"] = offset
+            elif "page" in b:
+                b["page"] = page_num
+            else:
+                b["offset"] = offset
+            body = json.dumps(b)
+        except Exception:
+            pass
+
+    if api["method"] == "GET":
+        url = _url_for_page(url, page_num)
+
+    result = await page.evaluate("""
+        async ({url, method, headers, body}) => {
+            try {
+                const opts = {method, headers, credentials: 'include', mode: 'cors'};
+                if (method !== 'GET' && body) opts.body = body;
+                const resp = await fetch(url, opts);
+                if (!resp.ok) return {__error: resp.status + ' ' + resp.statusText};
+                return await resp.json();
+            } catch(e) { return {__error: String(e)}; }
+        }
+    """, {"url": url, "method": api["method"], "headers": api["headers"], "body": body})
+
+    return result if isinstance(result, dict) else {}
+
+
+async def _get_total_pages_from_count(page) -> int:
+    """Estime le nombre de pages depuis le compteur d'annonces affiché."""
     try:
         count_text = await page.evaluate("""() => {
             const sels = [
@@ -608,53 +633,87 @@ async def _get_total_pages(page) -> int:
             }
             return '';
         }""")
-        m = re.search(r"(\d[\d\u202f\s]*\d|\d)", count_text)
+        m = re.search(r"(\d[\d\s]*\d|\d)", count_text)
         if m:
-            count = int(re.sub(r"[\s\u202f]", "", m.group(1)))
+            count = int(re.sub(r"\s+", "", m.group(1)))
             pages = math.ceil(count / 35)
             if pages > 1:
                 print(f"  → {count} annonces détectées → {pages} pages estimées")
                 return pages
     except Exception:
         pass
-
     return 1
-
-
-def _url_for_page(base_url: str, n: int) -> str:
-    """Construit l'URL pour la page n."""
-    if re.search(r"[?&]page=\d+", base_url):
-        return re.sub(r"(page=)\d+", f"\\g<1>{n}", base_url)
-    sep = "&" if "?" in base_url else "?"
-    return f"{base_url}{sep}page={n}"
 
 
 async def scrape_results_page(page) -> list:
     """
-    MODE MANUEL — 100% indétectable par DataDome.
+    Collecte les annonces sur toutes les pages de résultats.
 
-    Le script lit les liens de la page courante, puis attend que TU
-    navigues vers la page suivante dans Chrome. Aucune action automatique
-    sur le navigateur pendant la pagination.
+    Stratégie 1 (automatique) — API interception :
+      • Recharge la page une fois avec un listener réseau
+      • Capture l'appel API interne de LeBonCoin (finder/search)
+      • Rejoue les pages suivantes via fetch() natif du navigateur
+      → Indétectable par DataDome (TLS natif Chrome, cookies inclus)
 
-    Commandes dans le terminal :
-      [Entrée]      → page suivante collectée
-      stop / s      → arrêter la collecte et passer au scraping des annonces
+    Stratégie 2 (fallback manuel) — si l'API n'est pas interceptée :
+      • Tu navigues manuellement dans Chrome page par page
+      • Appuie sur Entrée après chaque page, "stop" pour terminer
     """
     await page.wait_for_load_state("networkidle")
 
-    # Détecter le total de pages pour affichage
-    total_pages = await _get_total_pages(page)
+    # ── Tentative d'interception API ──────────────────────────────
+    print()
+    print("  [API] Tentative d'interception de l'API LeBonCoin…")
+    api = await _capture_api_call(page)
 
-    all_links = []
-    page_num  = 1
+    if api and api.get("url"):
+        # ── Mode API : pagination automatique ─────────────────
+        all_links = _extract_links_from_api(api["page1_data"])
+        total     = api.get("total", 0)
+        per_page  = api.get("per_page", len(all_links)) or 35
+        total_pages = math.ceil(total / per_page) if total else 1
+
+        print(f"  [API] Mode automatique activé — {total_pages} page(s) à collecter")
+        print(f"  [API] Page 1 : {len(all_links)} liens")
+
+        for pn in range(2, total_pages + 1):
+            await page.wait_for_timeout(random.randint(1200, 2800))
+            data = await _fetch_page_via_browser(page, api, pn)
+
+            if data.get("__error"):
+                print(f"  [API] Page {pn} erreur : {data['__error']} — arrêt pagination")
+                break
+
+            page_links = _extract_links_from_api(data)
+            if not page_links:
+                print(f"  [API] Page {pn} : 0 liens — arrêt pagination")
+                break
+
+            new = [l for l in page_links if l not in all_links]
+            all_links.extend(new)
+            print(f"  [API] Page {pn}/{total_pages} : {len(new)} liens  [total : {len(all_links)}]")
+
+        print()
+        print(f"  ══ Collecte API terminée : {len(all_links)} annonce(s) ══")
+        print()
+
+        return [{"url": l, "title": BLANK, "price": None, "location": BLANK,
+                 "surface": None, "loyer": None, "taxe_fonciere": None,
+                 "charges": None, "nb_pieces": None, "description": None}
+                for l in all_links]
+
+    # ── Mode manuel (fallback) ─────────────────────────────────────
+    print("  [API] Aucune API interceptée — mode navigation manuelle")
+    total_pages = await _get_total_pages_from_count(page)
+    all_links   = []
+    page_num    = 1
 
     print()
     print("  ╔══════════════════════════════════════════════════════╗")
     print("  ║  MODE NAVIGATION MANUELLE — anti-détection DataDome  ║")
     print("  ╚══════════════════════════════════════════════════════╝")
     if total_pages > 1:
-        print(f"  → {total_pages} page(s) détectée(s)")
+        print(f"  → {total_pages} page(s) estimée(s)")
     print()
 
     while True:
@@ -665,7 +724,11 @@ async def scrape_results_page(page) -> list:
         all_links.extend(new)
 
         pbar = f"{page_num}/{total_pages}" if total_pages > 1 else str(page_num)
-        print(f"  ✓ Page {pbar} : {len(new)} annonce(s) collectée(s)  [total : {len(all_links)}]")
+        print(f"  ✓ Page {pbar} : {len(new)} annonce(s)  [total : {len(all_links)}]")
+
+        if total_pages > 1 and page_num >= total_pages:
+            print(f"  → Toutes les {total_pages} pages collectées")
+            break
 
         print()
         print(f"  ┌─ ACTION REQUISE ──────────────────────────────────────")
@@ -679,22 +742,13 @@ async def scrape_results_page(page) -> list:
         user_input = user_input.strip().lower()
 
         if user_input in ("stop", "s", "q", "fin", "done"):
-            print(f"  → Collecte terminée manuellement")
+            print("  → Collecte terminée manuellement")
             break
 
-        # Attendre que Chrome ait chargé la nouvelle page
         await page.wait_for_load_state("networkidle")
         await page.wait_for_timeout(1000)
-
-        # Vérifier un éventuel blocage sur la nouvelle page
         await detect_and_handle_block(page)
-
         page_num += 1
-
-        # Arrêt automatique si on a atteint le total connu
-        if total_pages > 1 and page_num > total_pages:
-            print(f"  → Toutes les {total_pages} pages collectées")
-            break
 
     print()
     print(f"  ══ Collecte terminée : {len(all_links)} annonce(s) au total ══")
@@ -702,7 +756,8 @@ async def scrape_results_page(page) -> list:
 
     return [{"url": l, "title": BLANK, "price": None, "location": BLANK,
              "surface": None, "loyer": None, "taxe_fonciere": None,
-             "charges": None, "nb_pieces": None, "description": None} for l in all_links]
+             "charges": None, "nb_pieces": None, "description": None}
+            for l in all_links]
 
 # ── Scraping détail annonce ────────────────────────────────────────
 async def scrape_listing_detail(context, url: str) -> dict:
@@ -1026,7 +1081,7 @@ window.addEventListener('DOMContentLoaded',()=>{
 def _fmt(val, suf="", dec=None):
     if val == BLANK or val is None: return f'<span style="color:#bbb">{BLANK}</span>'
     if dec is not None: return f"{val:.{dec}f}{suf}"
-    if isinstance(val, int): return f"{val:,}{suf}".replace(",", "\u202f")
+    if isinstance(val, int): return f"{val:,}{suf}".replace(",", " ")
     return f"{val}{suf}"
 
 def _rdt_class(y):
